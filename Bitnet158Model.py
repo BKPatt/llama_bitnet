@@ -1,83 +1,103 @@
 import math
+import os
 import torch
-import json
-from transformers import LlamaForCausalLM, LlamaConfig, AutoTokenizer
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import AutoModel, AutoTokenizer, LlamaConfig
 import logging
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(filename='model_inference.log', level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-def load_llama_model():
-    logger.info("Loading Llama 3 8b model...")
-    llama_model = LlamaForCausalLM.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
-    llama_weights = llama_model.state_dict()
-    llama_config = llama_model.config
-    logger.info(f"Llama model loaded. Config: {llama_config}")
-    return llama_weights, llama_config
+class BitNetLayer(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(BitNetLayer, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.Tensor(out_features, in_features))
+        self.scale = nn.Parameter(torch.Tensor(out_features))
+        self.reset_parameters()
 
-def save_llama_weights_and_config(llama_weights, llama_config):
-    logger.info("Saving Llama weights and config...")
-    torch.save(llama_weights, 'llama3_8b_weights.pth')
-    with open('llama3_8b_config.json', 'w') as f:
-        f.write(llama_config.to_json_string())
-    logger.info("Llama weights and config saved.")
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        nn.init.constant_(self.scale, 1.0)
 
-def verify_saved_data(llama_weights, llama_config):
-    logger.info("Verifying saved weights and config...")
-    loaded_weights = torch.load('llama3_8b_weights.pth')
-    with open('llama3_8b_config.json', 'r') as f:
-        loaded_config = f.read()
+    def quantize_weights(self, weight):
+        abs_weight = torch.abs(weight)
+        scale = torch.mean(abs_weight, dim=1).clamp(min=1e-8)
+        scaled_weight = weight / scale.unsqueeze(1)
+        binary_weight = torch.sign(scaled_weight)
+        return binary_weight, scale
 
-    assert loaded_weights.keys() == llama_weights.keys(), "Mismatch in saved weight keys"
-    for key in loaded_weights.keys():
-        assert torch.equal(loaded_weights[key], llama_weights[key]), f"Mismatch in weights for key: {key}"
-
-    assert loaded_config == llama_config.to_json_string(), "Mismatch in saved config"
-    logger.info("Verification complete. Saved data matches original.")
-
-class Bitnet158Model(torch.nn.Module):
+    def forward(self, input):
+        binary_weight, scale = self.quantize_weights(self.weight)
+        output = F.linear(input, binary_weight)
+        output = output * scale.unsqueeze(0).unsqueeze(0) * self.scale.unsqueeze(0).unsqueeze(0)
+        return torch.nan_to_num(output, nan=0.0, posinf=1e6, neginf=-1e6)
+    
+class BitNetAttention(nn.Module):
     def __init__(self, config):
-        super(Bitnet158Model, self).__init__()
+        super().__init__()
         self.config = config
-        self.padding_idx = getattr(config, 'pad_token_id', 0)  # Use 0 as default if pad_token_id is not present
-        self.vocab_size = config.vocab_size
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+
+        self.q_proj = BitNetLayer(self.hidden_size, self.num_heads * self.head_dim)
+        self.k_proj = BitNetLayer(self.hidden_size, self.num_key_value_heads * self.head_dim)
+        self.v_proj = BitNetLayer(self.hidden_size, self.num_key_value_heads * self.head_dim)
+        self.o_proj = BitNetLayer(self.num_heads * self.head_dim, self.hidden_size)
+
+    def forward(self, hidden_states, attention_mask=None):
+        batch_size, seq_length, _ = hidden_states.size()
         
-        self.embed_tokens = torch.nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = torch.nn.ModuleList([BitnetDecoderLayer(config) for _ in range(config.num_hidden_layers)])
-        self.norm = torch.nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
-        
-        self.lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        
-        # Initialize weights and apply final processing
-        self.post_init()
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
 
-    def post_init(self):
-        for module in self.modules():
-            if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
-                torch.nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
-            if isinstance(module, torch.nn.Linear) and module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
+        query_states = query_states.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(batch_size, seq_length, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(batch_size, seq_length, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-    def forward(self, input_ids, attention_mask=None):
-        hidden_states = self.embed_tokens(input_ids)
+        logger.debug(f"Query shape: {query_states.shape}")
+        logger.debug(f"Key shape: {key_states.shape}")
+        logger.debug(f"Value shape: {value_states.shape}")
 
-        for decoder_layer in self.layers:
-            layer_outputs = decoder_layer(hidden_states, attention_mask)
-            hidden_states = layer_outputs[0]
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        hidden_states = self.norm(hidden_states)
-        logits = self.lm_head(hidden_states)
+        attn_weights = torch.matmul(query_states, key_states.transpose(-1, -2)) / math.sqrt(self.head_dim)
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+        attn_weights = F.softmax(attn_weights, dim=-1)
 
-        return logits
+        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_length, self.hidden_size)
+        attn_output = self.o_proj(attn_output)
 
-class BitnetDecoderLayer(torch.nn.Module):
+        return attn_output
+
+class BitNetMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.gate_proj = BitNetLayer(config.hidden_size, config.intermediate_size)
+        self.down_proj = BitNetLayer(config.intermediate_size, config.hidden_size)
+        self.up_proj = BitNetLayer(config.hidden_size, config.intermediate_size)
+        self.act_fn = F.silu
+
+    def forward(self, x):
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+class BitNetDecoderLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = BitnetAttention(config)
-        self.mlp = BitnetMLP(config)
-        self.input_layernorm = torch.nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = torch.nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.self_attn = BitNetAttention(config)
+        self.mlp = BitNetMLP(config)
+        self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, hidden_states, attention_mask=None):
         residual = hidden_states
@@ -90,122 +110,97 @@ class BitnetDecoderLayer(torch.nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        return (hidden_states,)
+        return hidden_states
 
-class BitnetAttention(torch.nn.Module):
+class BitNetModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.max_position_embeddings = config.max_position_embeddings
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList([BitNetDecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.norm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.q_proj = torch.nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = torch.nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = torch.nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = torch.nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+    def forward(self, input_ids, attention_mask=None):
+        hidden_states = self.embed_tokens(input_ids)
 
-    def forward(self, hidden_states, attention_mask=None):
-        bsz, q_len, _ = hidden_states.size()
+        for i, layer in enumerate(self.layers):
+            logger.debug(f"Processing layer {i}")
+            logger.debug(f"Before layer: {hidden_states.shape}")
+            hidden_states = layer(hidden_states, attention_mask)
+            logger.debug(f"After layer: {hidden_states.shape}")
 
-        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
 
-        key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
-        value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
-
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / (self.head_dim ** 0.5)
-
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-
-        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
-
-        attn_output = torch.matmul(attn_weights, value_states)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, self.hidden_size)
-        attn_output = self.o_proj(attn_output)
-
-        return attn_output
-
-class BitnetMLP(torch.nn.Module):
+class BitNetForCausalLM(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.gate_proj = torch.nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = torch.nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = torch.nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = torch.nn.SiLU()
+        self.model = BitNetModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    def forward(self, x):
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    def forward(self, input_ids, attention_mask=None):
+        hidden_states = self.model(input_ids, attention_mask)
+        logits = self.lm_head(hidden_states)
+        return logits
 
-def map_weights(llama_weights, bitnet_model):
-    logger.info("Starting weight mapping process...")
-    mapped_weights = {}
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+def load_llama_model(model_name):
+    llama_model = AutoModel.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+    return llama_model, tokenizer
+
+def create_bitnet_model(llama_model):
+    config = LlamaConfig.from_pretrained(llama_model.config._name_or_path)
+    return BitNetForCausalLM(config)
+
+def save_bitnet_model(model, tokenizer, save_directory):
+    if not os.path.exists(save_directory):
+        os.makedirs(save_directory)
     
-    # Map embedding weights
-    mapped_weights['embed_tokens.weight'] = llama_weights['model.embed_tokens.weight']
-    
-    # Map layer weights
-    for i in range(bitnet_model.config.num_hidden_layers):
-        logger.info(f"Mapping weights for layer {i}")
-        layer_prefix = f'model.layers.{i}.'
-        mapped_prefix = f'layers.{i}.'
-        
-        # Attention weights
-        mapped_weights[f'{mapped_prefix}self_attn.q_proj.weight'] = llama_weights[f'{layer_prefix}self_attn.q_proj.weight']
-        mapped_weights[f'{mapped_prefix}self_attn.k_proj.weight'] = llama_weights[f'{layer_prefix}self_attn.k_proj.weight']
-        mapped_weights[f'{mapped_prefix}self_attn.v_proj.weight'] = llama_weights[f'{layer_prefix}self_attn.v_proj.weight']
-        mapped_weights[f'{mapped_prefix}self_attn.o_proj.weight'] = llama_weights[f'{layer_prefix}self_attn.o_proj.weight']
-        
-        # MLP weights
-        mapped_weights[f'{mapped_prefix}mlp.gate_proj.weight'] = llama_weights[f'{layer_prefix}mlp.gate_proj.weight']
-        mapped_weights[f'{mapped_prefix}mlp.up_proj.weight'] = llama_weights[f'{layer_prefix}mlp.up_proj.weight']
-        mapped_weights[f'{mapped_prefix}mlp.down_proj.weight'] = llama_weights[f'{layer_prefix}mlp.down_proj.weight']
-        
-        # Layernorm weights
-        mapped_weights[f'{mapped_prefix}input_layernorm.weight'] = llama_weights[f'{layer_prefix}input_layernorm.weight']
-        mapped_weights[f'{mapped_prefix}post_attention_layernorm.weight'] = llama_weights[f'{layer_prefix}post_attention_layernorm.weight']
-    
-    # Map final layer norm and lm_head weights
-    mapped_weights['norm.weight'] = llama_weights['model.norm.weight']
-    mapped_weights['lm_head.weight'] = llama_weights['lm_head.weight']
-    
-    logger.info("Weight mapping process completed.")
-    return mapped_weights
+    # Save the model state dict
+    model_path = os.path.join(save_directory, "bitnet_model.pt")
+    torch.save(model.state_dict(), model_path)
+    logger.info(f"BitNet model saved to {model_path}")
+
+    # Save the config
+    config_path = os.path.join(save_directory, "config.json")
+    model.model.config.to_json_file(config_path)
+    logger.info(f"Config saved to {config_path}")
+
+    # Save the tokenizer
+    tokenizer.save_pretrained(save_directory)
+    logger.info(f"Tokenizer saved to {save_directory}")
 
 def main():
-    logger.info("Starting Llama to Bitnet conversion process.")
-
-    llama_weights, llama_config = load_llama_model()
+    model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
+    llama_model, tokenizer = load_llama_model(model_name)
     
-    logger.info("Initializing Bitnet 1.58 model...")
-    bitnet_model = Bitnet158Model(llama_config)
-
-    logger.info("Mapping weights...")
-    bitnet_weights = map_weights(llama_weights, bitnet_model)
-
-    logger.info("Loading mapped weights into Bitnet model...")
-    bitnet_model.load_state_dict(bitnet_weights, strict=False)
-
-    logger.info("Saving Bitnet 1.58 model...")
-    torch.save(bitnet_model.state_dict(), 'bitnet1_58_weights.pth')
-
-    logger.info("Validating the conversion...")
-    bitnet_model.eval()
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
-    inputs = tokenizer("Hello, how are you?", return_tensors="pt")
-    with torch.no_grad():
-        outputs = bitnet_model(inputs.input_ids)
-    logger.info(f"Validation output shape: {outputs.shape}")
-
-    logger.info("Conversion process completed.")
+    bitnet_model = create_bitnet_model(llama_model)
+    
+    # Save the BitNet model and tokenizer
+    save_directory = "./bitnet_model_saved"
+    save_bitnet_model(bitnet_model, tokenizer, save_directory)
+    
+    input_text = "Your input text here"
+    inputs = tokenizer(input_text, return_tensors="pt", padding=True, truncation=True, max_length=512)
+    
+    logger.debug(f"Input IDs shape: {inputs['input_ids'].shape}")
+    logger.debug(f"Attention mask shape: {inputs['attention_mask'].shape}")
+    
+    try:
+        outputs = bitnet_model(input_ids=inputs['input_ids'], attention_mask=inputs['attention_mask'])
+        print(outputs.shape)
+    except Exception as e:
+        logger.error(f"Error during model inference: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
 
 if __name__ == "__main__":
     main()

@@ -1,79 +1,93 @@
 import torch
 from transformers import AutoTokenizer, LlamaConfig
-import json
-from Bitnet158Model import Bitnet158Model  # Make sure this import matches your file structure
+from Bitnet158Model import BitNetForCausalLM
 import logging
+import os
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def load_config(config_path):
-    with open(config_path, 'r') as f:
-        config_dict = json.load(f)
-    return LlamaConfig(**config_dict)
-
-def load_bitnet_model(model_path, config_path):
-    logger.info("Loading Bitnet model configuration...")
-    config = load_config(config_path)
+def load_bitnet_model(model_dir):
+    config_path = os.path.join(model_dir, "config.json")
+    model_path = os.path.join(model_dir, "bitnet_model.pt")
     
-    logger.info("Initializing Bitnet model...")
-    model = Bitnet158Model(config)
+    if not os.path.exists(config_path) or not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model files not found in {model_dir}")
     
-    logger.info("Loading model weights...")
+    config = LlamaConfig.from_json_file(config_path)
+    model = BitNetForCausalLM(config)
     model.load_state_dict(torch.load(model_path))
-    model.eval()
+    logger.info(f"BitNet model loaded from {model_dir}")
     return model
 
 def generate_text(model, tokenizer, prompt, max_length=50, temperature=0.7, top_k=50, top_p=0.95):
     model.eval()
     input_ids = tokenizer.encode(prompt, return_tensors="pt")
-    
-    logger.info(f"Generating text for prompt: '{prompt}'")
+    attention_mask = torch.ones_like(input_ids)
     
     with torch.no_grad():
         for _ in range(max_length):
-            outputs = model(input_ids)
-            next_token_logits = outputs[:, -1, :] / temperature
+            outputs = model(input_ids, attention_mask=attention_mask)
+            next_token_logits = outputs[:, -1, :]
+            
+            # Apply temperature
+            next_token_logits = next_token_logits / temperature
             
             # Apply top-k filtering
             top_k_logits, top_k_indices = torch.topk(next_token_logits, top_k)
+            next_token_logits[0, :] = torch.where(next_token_logits[0, :] < top_k_logits[0, -1], torch.tensor(-float('Inf')), next_token_logits[0, :])
             
             # Apply top-p (nucleus) filtering
-            cumulative_probs = torch.cumsum(torch.softmax(top_k_logits, dim=-1), dim=-1)
-            top_p_mask = cumulative_probs < top_p
-            top_p_mask[..., -1] = True  # Always keep the last token to ensure we have at least one to sample from
-            filtered_logits = top_k_logits * top_p_mask
+            sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = 0
+            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+            next_token_logits[0, indices_to_remove[0]] = -float('Inf')
             
-            # Sample from the filtered distribution
-            probs = torch.softmax(filtered_logits, dim=-1)
+            # Sample next token
+            probs = torch.softmax(next_token_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             
-            # Map back to the original token space
-            next_token = top_k_indices.gather(-1, next_token)
-            
+            # Append next token to input_ids and attention_mask
             input_ids = torch.cat([input_ids, next_token], dim=-1)
+            attention_mask = torch.cat([attention_mask, torch.ones_like(next_token)], dim=-1)
             
             if next_token.item() == tokenizer.eos_token_id:
                 break
     
-    generated_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
-    logger.info("Text generation completed.")
-    return generated_text
+    return tokenizer.decode(input_ids[0], skip_special_tokens=True)
 
 def main():
-    model_path = 'bitnet1_58_weights.pth'
-    config_path = 'llama3_8b_config.json'
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
+    # Load the saved BitNet model
+    model_dir = "./bitnet_model_saved"
+    bitnet_model = load_bitnet_model(model_dir)
     
-    logger.info("Loading Bitnet model...")
-    model = load_bitnet_model(model_path, config_path)
-    logger.info("Model loaded successfully.")
+    # Load the tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
     
-    prompt = "Once upon a time, in a faraway land,"
-    generated_text = generate_text(model, tokenizer, prompt)
+    # Test prompts
+    prompts = [
+        "Once upon a time, in a land far away,",
+        "The secret to a happy life is",
+        "In the year 2050, technology has advanced to the point where"
+    ]
     
-    print("\nGenerated text:")
-    print(generated_text)
+    logger.info("Starting inference tests...")
+    
+    for i, prompt in enumerate(prompts):
+        logger.info(f"Test {i+1}: Generating text for prompt: '{prompt}'")
+        
+        try:
+            generated_text = generate_text(bitnet_model, tokenizer, prompt)
+            logger.info(f"Generated text: {generated_text}")
+        except Exception as e:
+            logger.error(f"Error during inference: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+    
+    logger.info("Inference tests completed.")
 
 if __name__ == "__main__":
     main()
