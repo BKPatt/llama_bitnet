@@ -1,78 +1,77 @@
 import torch
-import os
-from transformers import LlamaForCausalLM, AutoTokenizer
-from BitNetB158Model import BitNetB158Model
+from transformers import LlamaForCausalLM
+
 from BitNetB158Config import BitNetB158Config
-from AbsmeanQuantization import AbsmeanQuantization
+from BitNetB158Model import BitNetB158Model
 
-def convert_llama_to_bitnet():
-    model_name = "meta-llama/Meta-Llama-3-8B-Instruct" 
-    save_directory = "./bitnet_model_saved"
-
-    # Load the pre-trained LLaMA model and tokenizer
-    llama_model = LlamaForCausalLM.from_pretrained(model_name)
-    llama_config = llama_model.config
-    llama_tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-    # Create BitNet b1.58 configuration
-    bitnet_config = BitNetB158Config(
-        vocab_size=llama_config.vocab_size,
-        hidden_size=llama_config.hidden_size,
-        intermediate_size=llama_config.intermediate_size,
-        num_hidden_layers=llama_config.num_hidden_layers,  
-        num_attention_heads=llama_config.num_attention_heads,
-        max_position_embeddings=llama_config.max_position_embeddings,
-        rms_norm_eps=llama_config.rms_norm_eps,
-        device="cuda" if torch.cuda.is_available() else "cpu"
-    )
-
-    # Create BitNet b1.58 model
+def convert_llama_to_bitnet(llama_model_path, bitnet_config_path, save_path):
+    llama_model = LlamaForCausalLM.from_pretrained(llama_model_path)
+    bitnet_config = BitNetB158Config.from_json_file(bitnet_config_path)
     bitnet_model = BitNetB158Model(bitnet_config)
+
+    llama_state_dict = llama_model.state_dict()
+    bitnet_state_dict = bitnet_model.state_dict()
+
+    # Use the updated mapping function
+    new_state_dict = map_llama_to_bitnet(llama_state_dict, bitnet_state_dict)
     
-    # Copy and quantize weights from LLaMA to BitNet b1.58
+    # Load the mapped state dict into the BitNet model
+    bitnet_model.load_state_dict(new_state_dict, strict=False)
+
+    torch.save(bitnet_model.state_dict(), save_path)
+    print(f"Model saved to {save_path}")
+
+def map_llama_to_bitnet(llama_state_dict, bitnet_state_dict):
     new_state_dict = {}
 
-    # Embed tokens (keep as float)
-    new_state_dict['embed_tokens.weight'] = llama_model.model.embed_tokens.weight.data
-
-    for i, llama_layer in enumerate(llama_model.model.layers):
-        # Attention weights
-        new_state_dict[f'layers.{i}.self_attn.q_proj.quantized_weight'], new_state_dict[f'layers.{i}.self_attn.q_proj.weight_scale'] = AbsmeanQuantization.quantize(llama_layer.self_attn.q_proj.weight)
-        new_state_dict[f'layers.{i}.self_attn.k_proj.quantized_weight'], new_state_dict[f'layers.{i}.self_attn.k_proj.weight_scale'] = AbsmeanQuantization.quantize(llama_layer.self_attn.k_proj.weight)
-        new_state_dict[f'layers.{i}.self_attn.v_proj.quantized_weight'], new_state_dict[f'layers.{i}.self_attn.v_proj.weight_scale'] = AbsmeanQuantization.quantize(llama_layer.self_attn.v_proj.weight)
-        new_state_dict[f'layers.{i}.self_attn.o_proj.quantized_weight'], new_state_dict[f'layers.{i}.self_attn.o_proj.weight_scale'] = AbsmeanQuantization.quantize(llama_layer.self_attn.o_proj.weight)
-
-        # MLP weights
-        new_state_dict[f'layers.{i}.mlp.gate_proj.quantized_weight'], new_state_dict[f'layers.{i}.mlp.gate_proj.weight_scale'] = AbsmeanQuantization.quantize(llama_layer.mlp.gate_proj.weight)
-        new_state_dict[f'layers.{i}.mlp.up_proj.quantized_weight'], new_state_dict[f'layers.{i}.mlp.up_proj.weight_scale'] = AbsmeanQuantization.quantize(llama_layer.mlp.up_proj.weight)
-        new_state_dict[f'layers.{i}.mlp.down_proj.quantized_weight'], new_state_dict[f'layers.{i}.mlp.down_proj.weight_scale'] = AbsmeanQuantization.quantize(llama_layer.mlp.down_proj.weight)
+    for name, param in llama_state_dict.items():
+        # Embedding layer
+        if "embed_tokens.weight" in name:
+            new_name = "embed_tokens.weight"
+            if new_name in bitnet_state_dict:
+                new_state_dict[new_name] = param
+            else:
+                print(f"Skipping {name} as it does not exist in the BitNet model")
         
-        # Layer norms (keep as float)
-        new_state_dict[f'layers.{i}.input_layernorm.weight'] = llama_layer.input_layernorm.weight
-        new_state_dict[f'layers.{i}.post_attention_layernorm.weight'] = llama_layer.post_attention_layernorm.weight
+        # Handle combined q, k, v projections in one layer
+        elif "self_attn.q_proj.weight" in name:
+            base_name = name.replace("self_attn.q_proj.weight", "")
+            try:
+                # Assume BitNet combines q, k, v projections into one layer
+                q_proj = param
+                k_proj = llama_state_dict[f"{base_name}self_attn.k_proj.weight"]
+                v_proj = llama_state_dict[f"{base_name}self_attn.v_proj.weight"]
+                combined_proj = torch.cat([q_proj, k_proj, v_proj], dim=0)
+                
+                if f"{base_name}self_attn.proj.weight" in bitnet_state_dict:
+                    new_state_dict[f"{base_name}self_attn.proj.weight"] = combined_proj
+                else:
+                    print(f"Skipping combined projection for {name} as it does not match any BitNet layer")
+                
+            except KeyError as e:
+                print(f"Skipping {name} due to missing component: {e}")
         
-    # Final layer norm (keep as float)
-    new_state_dict['norm.weight'] = llama_model.model.norm.weight
+        # MLP and LayerNorm components
+        elif any(key in name for key in ["mlp", "input_layernorm", "post_attention_layernorm", "norm"]):
+            if name in bitnet_state_dict:
+                if param.shape == bitnet_state_dict[name].shape:
+                    new_state_dict[name] = param
+                else:
+                    print(f"Skipping {name} due to shape mismatch: expected {bitnet_state_dict[name].shape}, got {param.shape}")
+            else:
+                print(f"Skipping {name} as it does not exist in the BitNet model")
+        
+        else:
+            print(f"Skipping {name} as it does not match any BitNet layer")
     
-    # Load the new state dict
-    bitnet_model.load_state_dict(new_state_dict)
-
-    # Create the save directory if it doesn't exist  
-    os.makedirs(save_directory, exist_ok=True)
-
-    # Save the converted model
-    torch.save(bitnet_model.state_dict(), os.path.join(save_directory, "pytorch_model.bin"))
-    
-    # Save the configuration
-    bitnet_config.to_json(os.path.join(save_directory, "config.json"))
-
-    # Save the tokenizer
-    llama_tokenizer.save_pretrained(save_directory)
-
-    print(f"Converted model, configuration, and tokenizer saved to {save_directory}")
+    return new_state_dict
 
 def main():
-    convert_llama_to_bitnet()
+    llama_model_path = "meta-llama/Meta-Llama-3-8B-Instruct"
+    bitnet_config_path = "c:/Users/brant/Desktop/gemmaft/test/config.json"
+    save_path = "./bitnet_model.pth"
+    
+    convert_llama_to_bitnet(llama_model_path, bitnet_config_path, save_path)
 
 if __name__ == "__main__":
     main()

@@ -1,37 +1,53 @@
-import json
-from dataclasses import dataclass, asdict
-import torch
+from transformers import PretrainedConfig
 
-@dataclass
-class BitNetB158Config:
-    vocab_size: int = 32000
-    hidden_size: int = 4096
-    intermediate_size: int = 11008
-    num_hidden_layers: int = 32
-    num_attention_heads: int = 32
-    max_position_embeddings: int = 2048
-    rms_norm_eps: float = 1e-6
-    initializer_range: float = 0.02
-    use_cache: bool = True
-    pad_token_id: int = 0
-    bos_token_id: int = 1
-    eos_token_id: int = 2
-    tie_word_embeddings: bool = False
-    quantization_bits: float = 1.58
-    output_attentions: bool = False
-    output_hidden_states: bool = False
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+class BitNetB158Config(PretrainedConfig):
+    model_type = "bitnet-b158"
 
-    def __post_init__(self):
-        self.head_dim = self.hidden_size // self.num_attention_heads
-        assert self.head_dim * self.num_attention_heads == self.hidden_size, "hidden_size must be divisible by num_attention_heads"
+    def __init__(
+        self,
+        vocab_size=32000,
+        hidden_size=4096,
+        num_hidden_layers=32,
+        num_attention_heads=32,
+        intermediate_size=16384,
+        hidden_act="gelu",
+        max_position_embeddings=2048,
+        initializer_range=0.02,
+        layer_norm_eps=1e-5,
+        rotary_emb_base=10000,
+        hidden_dropout_prob=0.1,  # Added attribute
+        attention_dropout=0.1,    # Added attribute
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.intermediate_size = intermediate_size
+        self.hidden_act = hidden_act
+        self.max_position_embeddings = max_position_embeddings
+        self.initializer_range = initializer_range
+        self.layer_norm_eps = layer_norm_eps
+        self.rotary_emb_base = rotary_emb_base
+        self.hidden_dropout_prob = hidden_dropout_prob  # Initialize hidden_dropout_prob
+        self.attention_dropout = attention_dropout      # Initialize attention_dropout
+        self.use_cache = kwargs.get("use_cache", True)
 
     @classmethod
-    def from_json(cls, json_file):
-        with open(json_file, 'r') as f:
-            config_dict = json.load(f)
-        return cls(**config_dict)
-
-    def to_json(self, json_file):
-        with open(json_file, 'w') as f:
-            json.dump(asdict(self), f, indent=2)
+    def from_llama_config(cls, llama_config):
+        return cls(
+            vocab_size=llama_config.vocab_size,
+            hidden_size=llama_config.hidden_size,
+            num_hidden_layers=llama_config.num_hidden_layers,
+            num_attention_heads=llama_config.num_attention_heads,
+            intermediate_size=llama_config.intermediate_size,
+            hidden_act=llama_config.hidden_act,
+            max_position_embeddings=llama_config.max_position_embeddings,
+            initializer_range=llama_config.initializer_range,
+            layer_norm_eps=llama_config.layer_norm_eps,
+            rotary_emb_base=llama_config.rotary_emb_base,
+            hidden_dropout_prob=llama_config.hidden_dropout_prob,  # Include in from_llama_config method
+            attention_dropout=llama_config.attention_dropout,      # Include in from_llama_config method
+            use_cache=llama_config.use_cache,
+        )

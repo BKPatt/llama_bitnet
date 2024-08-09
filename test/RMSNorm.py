@@ -1,19 +1,26 @@
-from typing import Tuple
 import torch
 import torch.nn as nn
-from AbsmeanQuantization import AbsmeanQuantization
 
 class RMSNorm(nn.Module):
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
+    def __init__(self, dim, eps=1e-8):
+        super(RMSNorm, self).__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
 
-    def forward(self, hidden_states: torch.Tensor, hidden_states_scale: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        input_dtype = hidden_states.dtype
-        variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
-        hidden_states_float = hidden_states.float() * hidden_states_scale
-        hidden_states_float = hidden_states_float * torch.rsqrt(variance + self.variance_epsilon)
-        hidden_states_float = self.weight * hidden_states_float
-        hidden_states, new_scale = AbsmeanQuantization.quantize(hidden_states_float)
-        return hidden_states.to(input_dtype), new_scale
+    def forward(self, x):
+        # Compute the mean square
+        norm_x = x.norm(2, dim=-1, keepdim=True)
+        rms_x = norm_x * (x.shape[-1] ** -0.5)
+        
+        # Normalize
+        x_normed = x / (rms_x + self.eps)
+        
+        # Scale
+        return self.weight * x_normed
+
+    def extra_repr(self):
+        return 'eps={}'.format(self.eps)
+
+# Example usage
+# layer = RMSNorm(4096)
+# output = layer(input_tensor)

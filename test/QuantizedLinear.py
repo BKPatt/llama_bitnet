@@ -1,38 +1,43 @@
+import math
 import torch
 import torch.nn as nn
-import math
 import torch.nn.functional as F
-from AbsmeanQuantization import AbsmeanQuantization
 
 class QuantizedLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, bias: bool = False, device=None):
-        super().__init__()
+    def __init__(self, in_features, out_features, bias=True, quantization_scheme='absmean'):
+        super(QuantizedLinear, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Initialize weights
-        weight = torch.empty(out_features, in_features, device=self.device)
-        nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
-        
-        # Quantize weights
-        quantized_weight, weight_scale = AbsmeanQuantization.quantize(weight)
-        self.quantized_weight = nn.Parameter(quantized_weight.to(self.device), requires_grad=False)
-        self.weight_scale = nn.Parameter(weight_scale.to(self.device))
-        
+        self.quantization_scheme = quantization_scheme
+
+        self.weight = nn.Parameter(torch.Tensor(out_features, in_features))
         if bias:
-            self.bias = nn.Parameter(torch.Tensor(out_features).to(self.device))
-            nn.init.uniform_(self.bias, -0.1, 0.1)
+            self.bias = nn.Parameter(torch.Tensor(out_features))
         else:
             self.register_parameter('bias', None)
 
-    def forward(self, input: torch.Tensor, input_scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        dequantized_weight = self.quantized_weight.float() * self.weight_scale
-        output = F.linear(input.float() * input_scale, dequantized_weight, self.bias)
-        output, output_scale = AbsmeanQuantization.quantize(output)
-        return output, output_scale
+        self.reset_parameters()
 
-    def extra_repr(self) -> str:
-        return 'in_features={}, out_features={}, bias={}'.format(
-            self.in_features, self.out_features, self.bias is not None
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, input):
+        quantized_weight = self.quantize_weight(self.weight)
+        return F.linear(input, quantized_weight, self.bias)
+
+    def quantize_weight(self, weight):
+        if self.quantization_scheme == 'absmean':
+            scale = weight.abs().mean(dim=1, keepdim=True)
+            quantized_weight = torch.round(weight / scale) * scale
+        else:
+            raise ValueError(f"Unsupported quantization scheme: {self.quantization_scheme}")
+        return quantized_weight
+
+    def extra_repr(self):
+        return 'in_features={}, out_features={}, bias={}, quantization_scheme={}'.format(
+            self.in_features, self.out_features, self.bias is not None, self.quantization_scheme
         )

@@ -1,102 +1,51 @@
 import torch
 import torch.nn as nn
-from typing import Optional, List, Union, Tuple
-from BitNetB158Config import BitNetB158Config
+
 from BitNetB158Layer import BitNetB158Layer
 from RMSNorm import RMSNorm
-from AbsmeanQuantization import AbsmeanQuantization
 
 class BitNetB158Model(nn.Module):
-    def __init__(self, config: BitNetB158Config):
+    def __init__(self, config):
         super().__init__()
         self.config = config
-        self.padding_idx = config.pad_token_id
-        self.vocab_size = config.vocab_size
-
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        
+        # Create the layers
         self.layers = nn.ModuleList([BitNetB158Layer(config) for _ in range(config.num_hidden_layers)])
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
+        # Final layer normalization
+        self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
+        
+        # Language modeling head
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, dict]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
+    def forward(self, input_ids, attention_mask=None):
+        # Embedding layer
+        hidden_states = self.embed_tokens(input_ids)
 
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
-        elif input_ids is not None:
-            input_shape = input_ids.size()
-            input_ids = input_ids.view(-1, input_shape[-1])
-        elif inputs_embeds is not None:
-            input_shape = inputs_embeds.size()[:-1]
-        else:
-            raise ValueError("You have to specify either input_ids or inputs_embeds")
+        # Process through all layers
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, attention_mask=attention_mask)
 
-        device = input_ids.device if input_ids is not None else inputs_embeds.device
+        # Final layer normalization
+        hidden_states = self.norm(hidden_states)
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+        # Language modeling head
+        logits = self.lm_head(hidden_states)
 
-        hidden_states, hidden_states_scale = AbsmeanQuantization.quantize(inputs_embeds)
+        return logits
 
-        batch_size, seq_length = input_shape
+    def get_input_embeddings(self):
+        return self.embed_tokens
 
-        presents = () if use_cache else None
-        all_self_attentions = () if output_attentions else None
-        all_hidden_states = () if output_hidden_states else None
+    def set_input_embeddings(self, new_embeddings):
+        self.embed_tokens = new_embeddings
 
-        if attention_mask is None:
-            attention_mask = torch.ones((batch_size, seq_length), device=device)
-        attention_mask_scale = torch.tensor(1.0, device=device)
+    def get_output_embeddings(self):
+        return self.lm_head.weight
 
-        for i, layer in enumerate(self.layers):
-            if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states,)
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head.weight = new_embeddings
 
-            layer_outputs = layer(
-                hidden_states,
-                hidden_states_scale,
-                attention_mask=attention_mask,
-                attention_mask_scale=attention_mask_scale,
-                position_ids=position_ids,
-                past_key_value=past_key_values[i] if past_key_values is not None else None,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-            )
-
-            hidden_states, hidden_states_scale = layer_outputs[:2]
-
-            if use_cache:
-                presents = presents + (layer_outputs[2 if output_attentions else 1],)
-
-            if output_attentions:
-                all_self_attentions = all_self_attentions + (layer_outputs[1],)
-
-        hidden_states, hidden_states_scale = self.norm(hidden_states, hidden_states_scale)
-
-        if output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_states,)
-
-        if not return_dict:
-            return tuple(v for v in [hidden_states, presents, all_hidden_states, all_self_attentions] if v is not None)
-
-        return {
-            "last_hidden_state": hidden_states,
-            "last_hidden_state_scale": hidden_states_scale,
-            "past_key_values": presents,
-            "hidden_states": all_hidden_states,
-            "attentions": all_self_attentions,
-        }
+    def prepare_inputs_for_generation(self, input_ids, attention_mask=None):
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
