@@ -1,73 +1,66 @@
 import torch
-import math
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class AbsmeanQuantization:
     @staticmethod
     def quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        logger.info(f"Quantizing tensor of shape: {x.shape}")
         scale = torch.mean(torch.abs(x), dim=-1, keepdim=True)
         q = torch.round(x / (scale + 1e-8)).clamp(-1, 1)
-        return q, scale
+        return q.to(torch.int8), scale
 
     @staticmethod
-    def dequantize(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        return q * scale
+    def quantized_matmul(q1: torch.Tensor, s1: torch.Tensor, q2: torch.Tensor, s2: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        logger.info(f"Quantized matmul with shapes: q1={q1.shape}, q2={q2.shape}")
+        
+        # Handle 4D tensors for attention operations
+        if q1.dim() == 4 and q2.dim() == 4:
+            batch_size, num_heads, seq_len, head_dim = q1.shape
+            _, _, kv_seq_len, kv_dim = q2.shape
+            
+            # Reshape for batch matrix multiplication
+            q1_reshaped = q1.transpose(1, 2).reshape(batch_size * seq_len, num_heads * head_dim)
+            q2_reshaped = q2.permute(0, 2, 1, 3).reshape(batch_size * kv_seq_len, num_heads * kv_dim)
+            
+            logger.info(f"Reshaped q1: {q1_reshaped.shape}, q2: {q2_reshaped.shape}")
+            
+            # Perform matrix multiplication
+            out_int = torch.bmm(q1_reshaped.int().view(batch_size, seq_len, num_heads * head_dim),
+                                q2_reshaped.int().view(batch_size, kv_seq_len, num_heads * kv_dim).transpose(1, 2))
+            
+            # Reshape the output
+            out_int = out_int.view(batch_size, seq_len, num_heads, kv_seq_len).transpose(1, 2)
+        else:
+            out_int = torch.matmul(q1.int(), q2.int())
+        
+        logger.info(f"Quantized matmul output shape: {out_int.shape}")
+        out_scale = s1 * s2
+        return out_int, out_scale
 
     @staticmethod
-    def pack(q: torch.Tensor) -> torch.Tensor:
-        # Convert to unsigned integers (0, 1, 2)
-        q_unsigned = (q + 1).to(torch.uint8)
-        
-        # Calculate number of elements and packed tensor shape
-        num_elements = q.numel()
-        packed_size = math.ceil(num_elements * 1.58 / 8)  # 1.58 bits per value
-        
-        # Reshape q_unsigned to 1D
-        q_unsigned = q_unsigned.reshape(-1)
-        
-        # Initialize packed tensor
-        packed = torch.zeros(packed_size, dtype=torch.uint8, device=q.device)
-        
-        # Pack values in batches
-        batch_size = 1000000  # Adjust this value based on your GPU memory
-        for start in range(0, num_elements, batch_size):
-            end = min(start + batch_size, num_elements)
-            batch = q_unsigned[start:end]
-            
-            bit_indices = torch.arange(start, end, device=q.device) * 1.58
-            byte_indices = (bit_indices // 8).long()
-            bit_offsets = (bit_indices % 8).long()
-            
-            # Pack lower bits
-            packed[byte_indices] |= batch << bit_offsets
-            
-            # Pack overflow bits
-            overflow_mask = bit_offsets > 6
-            if overflow_mask.any():
-                packed[byte_indices[overflow_mask] + 1] |= batch[overflow_mask] >> (8 - bit_offsets[overflow_mask])
-        
-        return packed
+    def quantized_add(a: torch.Tensor, a_scale: torch.Tensor, b: torch.Tensor, b_scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        logger.info(f"Quantized add with shapes: a={a.shape}, b={b.shape}")
+        if a_scale != b_scale:
+            if a_scale > b_scale:
+                b = (b.float() * b_scale / a_scale).round().to(torch.int32)
+                out_scale = a_scale
+            else:
+                a = (a.float() * a_scale / b_scale).round().to(torch.int32)
+                out_scale = b_scale
+        else:
+            out_scale = a_scale
+        out = a + b
+        logger.info(f"Quantized add output shape: {out.shape}")
+        return out, out_scale
 
     @staticmethod
-    def unpack(packed: torch.Tensor, original_shape: torch.Size) -> torch.Tensor:
-        num_elements = original_shape.numel()
-        q_unsigned = torch.zeros(num_elements, dtype=torch.uint8, device=packed.device)
-        
-        batch_size = 1000000  # Adjust this value based on your GPU memory
-        for start in range(0, num_elements, batch_size):
-            end = min(start + batch_size, num_elements)
-            
-            bit_indices = torch.arange(start, end, device=packed.device) * 1.58
-            byte_indices = (bit_indices // 8).long()
-            bit_offsets = (bit_indices % 8).long()
-            
-            # Unpack lower bits
-            q_unsigned[start:end] = (packed[byte_indices] >> bit_offsets) & 0b11
-            
-            # Unpack overflow bits
-            overflow_mask = bit_offsets > 6
-            if overflow_mask.any():
-                q_unsigned[start:end][overflow_mask] |= (packed[byte_indices[overflow_mask] + 1] << (8 - bit_offsets[overflow_mask])) & 0b11
-        
-        # Convert back to {-1, 0, 1}
-        q = q_unsigned.to(torch.int8) - 1
-        return q.reshape(original_shape)
+    def quantized_act(x: torch.Tensor, scale: torch.Tensor, act_fn) -> tuple[torch.Tensor, torch.Tensor]:
+        logger.info(f"Quantized activation input shape: {x.shape}")
+        x_float = x.float() * scale
+        out_float = act_fn(x_float)
+        out, out_scale = AbsmeanQuantization.quantize(out_float)
+        logger.info(f"Quantized activation output shape: {out.shape}")
+        return out, out_scale

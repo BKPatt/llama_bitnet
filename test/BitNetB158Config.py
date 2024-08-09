@@ -1,5 +1,6 @@
 import json
 from dataclasses import dataclass, asdict
+import torch
 
 @dataclass
 class BitNetB158Config:
@@ -16,7 +17,10 @@ class BitNetB158Config:
     bos_token_id: int = 1
     eos_token_id: int = 2
     tie_word_embeddings: bool = False
-    quantization_bits: float = 1.58  # Explicitly set to 1.58 bits
+    quantization_bits: float = 1.58
+    output_attentions: bool = False
+    output_hidden_states: bool = False
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     def __post_init__(self):
         self.head_dim = self.hidden_size // self.num_attention_heads

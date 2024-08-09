@@ -4,6 +4,7 @@ from typing import Optional, List, Union, Tuple
 from BitNetB158Config import BitNetB158Config
 from BitNetB158Layer import BitNetB158Layer
 from RMSNorm import RMSNorm
+from AbsmeanQuantization import AbsmeanQuantization
 
 class BitNetB158Model(nn.Module):
     def __init__(self, config: BitNetB158Config):
@@ -44,18 +45,22 @@ class BitNetB158Model(nn.Module):
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
+        device = input_ids.device if input_ids is not None else inputs_embeds.device
+
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
+        hidden_states, hidden_states_scale = AbsmeanQuantization.quantize(inputs_embeds)
+
         batch_size, seq_length = input_shape
-        hidden_states = inputs_embeds
 
         presents = () if use_cache else None
         all_self_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
         if attention_mask is None:
-            attention_mask = torch.ones((batch_size, seq_length), device=hidden_states.device)
+            attention_mask = torch.ones((batch_size, seq_length), device=device)
+        attention_mask_scale = torch.tensor(1.0, device=device)
 
         for i, layer in enumerate(self.layers):
             if output_hidden_states:
@@ -63,14 +68,16 @@ class BitNetB158Model(nn.Module):
 
             layer_outputs = layer(
                 hidden_states,
+                hidden_states_scale,
                 attention_mask=attention_mask,
+                attention_mask_scale=attention_mask_scale,
                 position_ids=position_ids,
                 past_key_value=past_key_values[i] if past_key_values is not None else None,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
             )
 
-            hidden_states = layer_outputs[0]
+            hidden_states, hidden_states_scale = layer_outputs[:2]
 
             if use_cache:
                 presents = presents + (layer_outputs[2 if output_attentions else 1],)
@@ -78,7 +85,7 @@ class BitNetB158Model(nn.Module):
             if output_attentions:
                 all_self_attentions = all_self_attentions + (layer_outputs[1],)
 
-        hidden_states = self.norm(hidden_states)
+        hidden_states, hidden_states_scale = self.norm(hidden_states, hidden_states_scale)
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
@@ -88,18 +95,8 @@ class BitNetB158Model(nn.Module):
 
         return {
             "last_hidden_state": hidden_states,
+            "last_hidden_state_scale": hidden_states_scale,
             "past_key_values": presents,
             "hidden_states": all_hidden_states,
             "attentions": all_self_attentions,
         }
-
-    def quantize(self):
-        """Quantize the model weights"""
-        for layer in self.layers:
-            layer.self_attn.q_proj.quantize()
-            layer.self_attn.k_proj.quantize()
-            layer.self_attn.v_proj.quantize()
-            layer.self_attn.o_proj.quantize()
-            layer.mlp.gate_proj.quantize()
-            layer.mlp.up_proj.quantize()
-            layer.mlp.down_proj.quantize()

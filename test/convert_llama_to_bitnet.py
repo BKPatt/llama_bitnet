@@ -6,7 +6,7 @@ from BitNetB158Config import BitNetB158Config
 from AbsmeanQuantization import AbsmeanQuantization
 
 def convert_llama_to_bitnet():
-    model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
+    model_name = "meta-llama/Meta-Llama-3-8B-Instruct" 
     save_directory = "./bitnet_model_saved"
 
     # Load the pre-trained LLaMA model and tokenizer
@@ -19,47 +19,50 @@ def convert_llama_to_bitnet():
         vocab_size=llama_config.vocab_size,
         hidden_size=llama_config.hidden_size,
         intermediate_size=llama_config.intermediate_size,
-        num_hidden_layers=llama_config.num_hidden_layers,
+        num_hidden_layers=llama_config.num_hidden_layers,  
         num_attention_heads=llama_config.num_attention_heads,
         max_position_embeddings=llama_config.max_position_embeddings,
         rms_norm_eps=llama_config.rms_norm_eps,
+        device="cuda" if torch.cuda.is_available() else "cpu"
     )
 
     # Create BitNet b1.58 model
     bitnet_model = BitNetB158Model(bitnet_config)
+    
+    # Copy and quantize weights from LLaMA to BitNet b1.58
+    new_state_dict = {}
 
-    # Copy weights from LLaMA to BitNet b1.58 and quantize
-    bitnet_model.embed_tokens.weight.data = llama_model.model.embed_tokens.weight.data
+    # Embed tokens (keep as float)
+    new_state_dict['embed_tokens.weight'] = llama_model.model.embed_tokens.weight.data
 
     for i, llama_layer in enumerate(llama_model.model.layers):
-        bitnet_layer = bitnet_model.layers[i]
+        # Attention weights
+        new_state_dict[f'layers.{i}.self_attn.q_proj.quantized_weight'], new_state_dict[f'layers.{i}.self_attn.q_proj.weight_scale'] = AbsmeanQuantization.quantize(llama_layer.self_attn.q_proj.weight)
+        new_state_dict[f'layers.{i}.self_attn.k_proj.quantized_weight'], new_state_dict[f'layers.{i}.self_attn.k_proj.weight_scale'] = AbsmeanQuantization.quantize(llama_layer.self_attn.k_proj.weight)
+        new_state_dict[f'layers.{i}.self_attn.v_proj.quantized_weight'], new_state_dict[f'layers.{i}.self_attn.v_proj.weight_scale'] = AbsmeanQuantization.quantize(llama_layer.self_attn.v_proj.weight)
+        new_state_dict[f'layers.{i}.self_attn.o_proj.quantized_weight'], new_state_dict[f'layers.{i}.self_attn.o_proj.weight_scale'] = AbsmeanQuantization.quantize(llama_layer.self_attn.o_proj.weight)
 
-        # Copy and quantize attention weights
-        for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
-            llama_weight = getattr(llama_layer.self_attn, proj).weight
-            quantized_weight, weight_scale = AbsmeanQuantization.quantize(llama_weight)
-            getattr(bitnet_layer.self_attn, proj).quantized_weight.data = quantized_weight.float()
-            getattr(bitnet_layer.self_attn, proj).weight_scale.data = weight_scale
+        # MLP weights
+        new_state_dict[f'layers.{i}.mlp.gate_proj.quantized_weight'], new_state_dict[f'layers.{i}.mlp.gate_proj.weight_scale'] = AbsmeanQuantization.quantize(llama_layer.mlp.gate_proj.weight)
+        new_state_dict[f'layers.{i}.mlp.up_proj.quantized_weight'], new_state_dict[f'layers.{i}.mlp.up_proj.weight_scale'] = AbsmeanQuantization.quantize(llama_layer.mlp.up_proj.weight)
+        new_state_dict[f'layers.{i}.mlp.down_proj.quantized_weight'], new_state_dict[f'layers.{i}.mlp.down_proj.weight_scale'] = AbsmeanQuantization.quantize(llama_layer.mlp.down_proj.weight)
+        
+        # Layer norms (keep as float)
+        new_state_dict[f'layers.{i}.input_layernorm.weight'] = llama_layer.input_layernorm.weight
+        new_state_dict[f'layers.{i}.post_attention_layernorm.weight'] = llama_layer.post_attention_layernorm.weight
+        
+    # Final layer norm (keep as float)
+    new_state_dict['norm.weight'] = llama_model.model.norm.weight
+    
+    # Load the new state dict
+    bitnet_model.load_state_dict(new_state_dict)
 
-        # Copy and quantize MLP weights
-        for proj in ['gate_proj', 'up_proj', 'down_proj']:
-            llama_weight = getattr(llama_layer.mlp, proj).weight
-            quantized_weight, weight_scale = AbsmeanQuantization.quantize(llama_weight)
-            getattr(bitnet_layer.mlp, proj).quantized_weight.data = quantized_weight.float()
-            getattr(bitnet_layer.mlp, proj).weight_scale.data = weight_scale
-
-        # Copy layer norm weights
-        bitnet_layer.input_layernorm.weight.data = llama_layer.input_layernorm.weight.data
-        bitnet_layer.post_attention_layernorm.weight.data = llama_layer.post_attention_layernorm.weight.data
-
-    bitnet_model.norm.weight.data = llama_model.model.norm.weight.data
-
-    # Create the save directory if it doesn't exist
+    # Create the save directory if it doesn't exist  
     os.makedirs(save_directory, exist_ok=True)
 
     # Save the converted model
     torch.save(bitnet_model.state_dict(), os.path.join(save_directory, "pytorch_model.bin"))
-
+    
     # Save the configuration
     bitnet_config.to_json(os.path.join(save_directory, "config.json"))
 
