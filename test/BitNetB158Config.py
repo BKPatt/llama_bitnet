@@ -8,8 +8,9 @@ class BitNetB158Config:
     intermediate_size: int = 11008
     num_hidden_layers: int = 32
     num_attention_heads: int = 32
-    max_position_embeddings: int = 2048
-    rms_norm_eps: float = 1e-6
+    num_key_value_heads: int = 32
+    max_position_embeddings: int = 4096
+    rms_norm_eps: float = 1e-5
     initializer_range: float = 0.02
     use_cache: bool = True
     pad_token_id: int = 0
@@ -17,12 +18,22 @@ class BitNetB158Config:
     eos_token_id: int = 2
     tie_word_embeddings: bool = False
     quantization_bits: float = 1.58
+    rope_theta: float = 10000.0
+    rope_scaling: dict = None
+    attention_bias: bool = False
+    attention_dropout: float = 0.0
+    hidden_dropout: float = 0.0
+    quant_type: str = "absmean"
     output_attentions: bool = False
     output_hidden_states: bool = False
+    num_attention_heads: int = 32
+    num_key_value_heads: int = 8
 
     def __post_init__(self):
         self.head_dim = self.hidden_size // self.num_attention_heads
         assert self.head_dim * self.num_attention_heads == self.hidden_size, "hidden_size must be divisible by num_attention_heads"
+        if self.rope_scaling is None:
+            self.rope_scaling = {"type": "linear", "factor": 1.0}
 
     @classmethod
     def from_json(cls, json_file):
