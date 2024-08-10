@@ -8,12 +8,12 @@ def generate_llama(model, tokenizer, prompt, max_length=100):
         outputs = model.generate(**inputs, max_length=max_length)
     return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-def compare_models(llama_model, llama_tokenizer, bitnet_pipeline, prompts):
+def compare_models(llama_model, bitnet_pipeline, llama_tokenizer, prompts):
     for i, prompt in enumerate(prompts):
         print(f"\nPrompt {i+1}: {prompt}")
         
         llama_output = generate_llama(llama_model, llama_tokenizer, prompt)
-        bitnet_output = bitnet_pipeline.generate(prompt, max_length=100)
+        bitnet_output = generate_llama(bitnet_pipeline, llama_tokenizer, prompt)
         
         print("\nLLaMA 3.1 output:")
         print(llama_output)
@@ -33,7 +33,7 @@ def main():
 
     # Load BitNet b1.58 model
     bitnet_model_path = "./bitnet_model_saved"
-    bitnet_pipeline = BitNetB158Pipeline(bitnet_model_path)
+    bitnet_pipeline = AutoTokenizer.from_pretrained(bitnet_model_path)
 
     # Prepare a set of diverse prompts
     prompts = [
@@ -45,7 +45,7 @@ def main():
     ]
 
     # Compare the models
-    compare_models(llama_model, llama_tokenizer, bitnet_pipeline, prompts)
+    compare_models(llama_model, bitnet_pipeline, llama_tokenizer, prompts)
 
 if __name__ == "__main__":
     main()

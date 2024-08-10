@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from BitNetB158Config import BitNetB158Config
 from QuantizedLinear import QuantizedLinear
+from SwiGLU import SwiGLU
 
 class BitNetMLP(nn.Module):
     def __init__(self, config: BitNetB158Config):
@@ -24,7 +24,3 @@ class BitNetMLP(nn.Module):
         down_output = self.down_proj(intermediate_output)
         
         return down_output
-
-class SwiGLU(nn.Module):
-    def forward(self, gate_output: torch.Tensor, up_output: torch.Tensor) -> torch.Tensor:
-        return F.silu(gate_output) * up_output
