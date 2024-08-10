@@ -15,26 +15,47 @@ class AbsmeanQuantization:
         return q.float() * scale
 
     @staticmethod
-    def pack(q: torch.Tensor) -> torch.Tensor:
-        q_unsigned = (q + 1).to(torch.uint8)  # Convert from [-1, 1] to [0, 2]
-        packed = torch.zeros((q_unsigned.numel() + 1) // 2, dtype=torch.uint8, device=q.device)
+    def pack(q: torch.Tensor, batch_size: int = 1000000) -> torch.Tensor:
+        q_unsigned = (q + 1).to(torch.uint8)
+        num_elements = q.numel()
+        packed_size = math.ceil(num_elements * 1.58 / 8)
+        q_unsigned = q_unsigned.reshape(-1)
+        packed = torch.zeros(packed_size, dtype=torch.uint8, device=q.device)
         
-        # Get all even-indexed elements and shift left by 4 bits for odd-indexed elements to combine them
-        # Handle the case where q has an odd number of elements by ignoring the last if it exists
-        if q_unsigned.numel() % 2 == 0:
-            packed = (q_unsigned[0::2] | (q_unsigned[1::2] << 4))
-        else:
-            # If there's an odd number of q elements, handle the last element separately
-            packed[:-1] = (q_unsigned[0::2] | (q_unsigned[1::2] << 4))
-            packed[-1] = q_unsigned[-2]  # Assign the last single element which has no pair
-
+        for start in range(0, num_elements, batch_size):
+            end = min(start + batch_size, num_elements)
+            batch = q_unsigned[start:end]
+            
+            bit_indices = torch.arange(start, end, device=q.device) * 1.58
+            byte_indices = (bit_indices // 8).long()
+            bit_offsets = (bit_indices % 8).long()
+            
+            packed[byte_indices] |= batch << bit_offsets
+            
+            overflow_mask = bit_offsets > 6
+            if overflow_mask.any():
+                packed[byte_indices[overflow_mask] + 1] |= batch[overflow_mask] >> (8 - bit_offsets[overflow_mask])
+        
         return packed
 
     @staticmethod
-    def unpack(packed: torch.Tensor, original_shape: torch.Size) -> torch.Tensor:
-        q_unsigned = torch.empty(original_shape.numel(), dtype=torch.uint8, device=packed.device)
-        q_unsigned[0::2] = packed[0::2] & 0x0F
-        q_unsigned[1::2] = packed[0::2] >> 4
+    def unpack(packed: torch.Tensor, original_shape: torch.Size, batch_size: int = 1000000) -> torch.Tensor:
+        num_elements = original_shape.numel()
+        q_unsigned = torch.zeros(num_elements, dtype=torch.uint8, device=packed.device)
+        
+        for start in range(0, num_elements, batch_size):
+            end = min(start + batch_size, num_elements)
+            
+            bit_indices = torch.arange(start, end, device=packed.device) * 1.58
+            byte_indices = (bit_indices // 8).long()
+            bit_offsets = (bit_indices % 8).long()
+            
+            q_unsigned[start:end] = (packed[byte_indices] >> bit_offsets) & 0b11
+            
+            overflow_mask = bit_offsets > 6
+            if overflow_mask.any():
+                q_unsigned[start:end][overflow_mask] |= (packed[byte_indices[overflow_mask] + 1] << (8 - bit_offsets[overflow_mask])) & 0b11
+        
         q = q_unsigned.to(torch.int8) - 1
         return q.reshape(original_shape)
 
@@ -57,7 +78,7 @@ class BitNetAttention(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
-        self.num_key_value_heads = 8
+        self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
 
@@ -65,7 +86,7 @@ class BitNetAttention(nn.Module):
         self.k_proj = QuantizedLinear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = QuantizedLinear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = QuantizedLinear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
-        
+
         self.rotary_emb = RotaryEmbedding(
             self.head_dim,
             max_position_embeddings=self.max_position_embeddings,
@@ -82,49 +103,56 @@ class BitNetAttention(nn.Module):
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
-
-        for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
-            if getattr(self, proj).quantized_weight is None:
-                getattr(self, proj).quantized_weight = torch.zeros_like(getattr(self, proj).weight, dtype=torch.int8)
-            if getattr(self, proj).weight_scale is None:
-                getattr(self, proj).weight_scale = torch.nn.Parameter(torch.ones(getattr(self, proj).weight.shape[0], 1))
+        print(f"Input hidden_states shape: {hidden_states.shape}")
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
+        print(f"After projection - query_states: {query_states.shape}, key_states: {key_states.shape}, value_states: {value_states.shape}")
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        print(f"After reshape and transpose - query_states: {query_states.shape}, key_states: {key_states.shape}, value_states: {value_states.shape}")
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        print(f"After rotary embedding - query_states: {query_states.shape}, key_states: {key_states.shape}")
 
         if past_key_value is not None:
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
+        print(f"After past_key_value concat - key_states: {key_states.shape}, value_states: {value_states.shape}")
 
         past_key_value = (key_states, value_states) if use_cache else None
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
+        print(f"After repeat_kv - key_states: {key_states.shape}, value_states: {value_states.shape}")
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        print(f"attn_weights shape after matmul: {attn_weights.shape}")
 
         if attention_mask is not None:
+            attention_mask = attention_mask[:, None, None, :]  # Reshape the mask to match attn_weights
+            print(f"attention_mask shape: {attention_mask.shape}")
             attn_weights = attn_weights + attention_mask
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+        print(f"attn_weights shape after softmax: {attn_weights.shape}")
 
         attn_output = torch.matmul(attn_weights, value_states)
+        print(f"attn_output shape after matmul: {attn_output.shape}")
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        print(f"Final attn_output shape: {attn_output.shape}")
 
         attn_output = self.o_proj(attn_output)
+        print(f"attn_output shape after o_proj: {attn_output.shape}")
 
         if not output_attentions:
             attn_weights = None
@@ -153,7 +181,7 @@ class BitNetB158Config:
     intermediate_size: int = 11008
     num_hidden_layers: int = 32
     num_attention_heads: int = 32
-    num_key_value_heads: int = 8  # Update this line
+    num_key_value_heads: int = 32
     max_position_embeddings: int = 4096
     rms_norm_eps: float = 1e-5
     initializer_range: float = 0.02
@@ -188,6 +216,7 @@ class BitNetB158Config:
         with open(json_file, 'w') as f:
             json.dump(asdict(self), f, indent=2)
 
+
 # BitNetB158Layer.py
 #==============================================================================
 import torch
@@ -209,14 +238,14 @@ class BitNetB158Layer(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: Optional[bool] = False,
-        use_cache: Optional[bool] = False,
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_value: Optional[Tuple[torch.Tensor]] = None,
+            output_attentions: Optional[bool] = False,
+            use_cache: Optional[bool] = False,
+        ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
@@ -248,6 +277,7 @@ class BitNetB158Layer(nn.Module):
 
         return outputs
 
+
 # BitNetB158Model.py
 #==============================================================================
 import torch
@@ -267,6 +297,22 @@ class BitNetB158Model(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList([BitNetB158Layer(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def load_state_dict(self, state_dict, strict=True):
+        # Adjusting weight_scale to match expected size
+        for name, param in self.state_dict().items():
+            if name in state_dict:
+                if "weight_scale" in name and state_dict[name].shape != param.shape:
+                    print(f"Resizing {name} from {state_dict[name].shape} to {param.shape}")
+                    # Use torch.nn.functional.interpolate to resize the tensor
+                    state_dict[name] = torch.nn.functional.interpolate(
+                        state_dict[name].unsqueeze(0).unsqueeze(0),
+                        size=param.shape,
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(0).squeeze(0)
+        
+        super().load_state_dict(state_dict, strict)
 
     def forward(
         self,
@@ -390,12 +436,14 @@ class BitNetB158Pipeline:
         model_file = os.path.join(model_path, "pytorch_model.bin")
         if os.path.exists(model_file):
             state_dict = torch.load(model_file, map_location=self.device)
-            self.model.load_state_dict(state_dict)
+            # Using strict=False to allow loading despite unexpected keys in the state_dict
+            self.model.load_state_dict(state_dict, strict=False)
         else:
             raise FileNotFoundError(f"Model file not found at {model_file}")
 
         self.model.to(self.device)
         self.model.eval()
+
 
     def generate(self, prompt: str, max_length: int = 100, temperature: float = 0.7, top_p: float = 0.9, top_k: int = 50):
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
@@ -504,6 +552,7 @@ def main():
 if __name__ == "__main__":
     main()
 
+
 # BitNetMLP.py
 #==============================================================================
 import torch
@@ -518,19 +567,13 @@ class BitNetMLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        
+
         self.gate_proj = QuantizedLinear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = QuantizedLinear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = QuantizedLinear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = SwiGLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for proj in ['gate_proj', 'up_proj', 'down_proj']:
-            if getattr(self, proj).quantized_weight is None:
-                getattr(self, proj).quantized_weight = torch.zeros_like(getattr(self, proj).weight, dtype=torch.int8)  
-            if getattr(self, proj).weight_scale is None:
-                getattr(self, proj).weight_scale = torch.nn.Parameter(torch.ones(getattr(self, proj).weight.shape[0], 1))
-
         gate_output = self.gate_proj(x)
         up_output = self.up_proj(x)
         
@@ -566,7 +609,7 @@ def convert_llama_to_bitnet(model_name: str, save_directory: str):
         intermediate_size=llama_config.intermediate_size,
         num_hidden_layers=llama_config.num_hidden_layers,
         num_attention_heads=llama_config.num_attention_heads,
-        num_key_value_heads=llama_config.num_attention_heads,
+        num_key_value_heads=llama_config.num_attention_heads // 4,
         max_position_embeddings=llama_config.max_position_embeddings,
         rms_norm_eps=llama_config.rms_norm_eps,
         rope_theta=500000,
@@ -584,19 +627,15 @@ def convert_llama_to_bitnet(model_name: str, save_directory: str):
 
         for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
             llama_weight = getattr(llama_layer.self_attn, proj).weight
-            bitnet_weight = getattr(bitnet_layer.self_attn, proj).weight
-            print(f"LLaMA {proj} weight shape: {llama_weight.shape}")
-            print(f"BitNet {proj} weight shape: {bitnet_weight.shape}")
-            getattr(bitnet_layer.self_attn, proj).weight.data.copy_(llama_weight)
-            getattr(bitnet_layer.self_attn, proj).quantize()
+            quantized_weight, weight_scale = AbsmeanQuantization.quantize(llama_weight)
+            getattr(bitnet_layer.self_attn, proj).quantized_weight.copy_(quantized_weight)
+            getattr(bitnet_layer.self_attn, proj).weight_scale.data.copy_(weight_scale)
 
         for proj in ['gate_proj', 'up_proj', 'down_proj']:
             llama_weight = getattr(llama_layer.mlp, proj).weight
-            bitnet_weight = getattr(bitnet_layer.mlp, proj).weight
-            print(f"LLaMA {proj} weight shape: {llama_weight.shape}")
-            print(f"BitNet {proj} weight shape: {bitnet_weight.shape}")
-            getattr(bitnet_layer.mlp, proj).weight.data.copy_(llama_weight)
-            getattr(bitnet_layer.mlp, proj).quantize()
+            quantized_weight, weight_scale = AbsmeanQuantization.quantize(llama_weight)
+            getattr(bitnet_layer.mlp, proj).quantized_weight.copy_(quantized_weight)
+            getattr(bitnet_layer.mlp, proj).weight_scale.data.copy_(weight_scale)
 
         bitnet_layer.input_layernorm.weight.data = llama_layer.input_layernorm.weight.data
         bitnet_layer.post_attention_layernorm.weight.data = llama_layer.post_attention_layernorm.weight.data
@@ -627,17 +666,13 @@ def main():
 if __name__ == "__main__":
     main()
 
+
 # QuantizedLinear.py
 #==============================================================================
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 from AbsmeanQuantization import AbsmeanQuantization
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 class QuantizedLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int, bias: bool = False):
@@ -645,7 +680,7 @@ class QuantizedLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         
-        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.register_buffer('quantized_weight', torch.zeros(out_features, in_features, dtype=torch.int8))
         self.weight_scale = nn.Parameter(torch.ones(out_features, 1))
         
         if bias:
@@ -653,26 +688,15 @@ class QuantizedLinear(nn.Module):
         else:
             self.register_parameter('bias', None)
 
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if not hasattr(self, 'quantized_weight'):
-            self.quantize()
-        unpacked_weight = AbsmeanQuantization.unpack(self.quantized_weight, self.weight.shape)
-        dequantized_weight = unpacked_weight.float() * self.weight_scale
+        dequantized_weight = self.quantized_weight.float() * self.weight_scale
         output = F.linear(input, dequantized_weight, self.bias)
         return output
 
     def quantize(self):
-        weight = self.weight.data
-        quantized_weight, weight_scale = AbsmeanQuantization.quantize(weight)
-        packed_weight = AbsmeanQuantization.pack(quantized_weight)
-        self.quantized_weight = nn.Parameter(packed_weight, requires_grad=False)
+        quantized_weight, weight_scale = AbsmeanQuantization.quantize(self.weight)
+        self.quantized_weight.copy_(quantized_weight)
         self.weight_scale.data.copy_(weight_scale)
-
 
 # RMSNorm.py
 #==============================================================================
@@ -691,6 +715,7 @@ class RMSNorm(nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return (self.weight * hidden_states).to(input_dtype)
 
+
 # RotaryEmbedding.py
 #==============================================================================
 import torch
@@ -700,23 +725,14 @@ import math
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim: int, max_position_embeddings: int = 2048, base: float = 10000.0, device=None):
         super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=device).float() / dim))
         self.register_buffer("inv_freq", inv_freq)
         self.max_seq_len_cached = max_position_embeddings
-        t = torch.arange(self.max_seq_len_cached, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
         self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
-
-    def forward(self, x: torch.Tensor, seq_len: int = None) -> tuple[torch.Tensor, torch.Tensor]:
-        if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len)
-
-        return (
-            self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
-            self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
-        )
 
     def _set_cos_sin_cache(self, seq_len: int):
         self.max_seq_len_cached = seq_len
@@ -725,6 +741,15 @@ class RotaryEmbedding(nn.Module):
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
         self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
+        
+    def forward(self, x: torch.Tensor, seq_len: int = None) -> tuple[torch.Tensor, torch.Tensor]:
+        if seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len)
+
+        return (
+            self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+            self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+        )
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     """Rotates half the hidden dims of the input."""

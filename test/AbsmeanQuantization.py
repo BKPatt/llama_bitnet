@@ -13,14 +13,13 @@ class AbsmeanQuantization:
         return q.float() * scale
 
     @staticmethod
-    def pack(q: torch.Tensor) -> torch.Tensor:
+    def pack(q: torch.Tensor, batch_size: int = 1000000) -> torch.Tensor:
         q_unsigned = (q + 1).to(torch.uint8)
         num_elements = q.numel()
         packed_size = math.ceil(num_elements * 1.58 / 8)
         q_unsigned = q_unsigned.reshape(-1)
         packed = torch.zeros(packed_size, dtype=torch.uint8, device=q.device)
         
-        batch_size = 1000000
         for start in range(0, num_elements, batch_size):
             end = min(start + batch_size, num_elements)
             batch = q_unsigned[start:end]
@@ -38,11 +37,10 @@ class AbsmeanQuantization:
         return packed
 
     @staticmethod
-    def unpack(packed: torch.Tensor, original_shape: torch.Size) -> torch.Tensor:
+    def unpack(packed: torch.Tensor, original_shape: torch.Size, batch_size: int = 1000000) -> torch.Tensor:
         num_elements = original_shape.numel()
         q_unsigned = torch.zeros(num_elements, dtype=torch.uint8, device=packed.device)
         
-        batch_size = 1000000
         for start in range(0, num_elements, batch_size):
             end = min(start + batch_size, num_elements)
             

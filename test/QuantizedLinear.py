@@ -1,12 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 from AbsmeanQuantization import AbsmeanQuantization
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 class QuantizedLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int, bias: bool = False):
@@ -28,5 +23,6 @@ class QuantizedLinear(nn.Module):
         return output
 
     def quantize(self):
-        weight = self.quantized_weight.float() * self.weight_scale
-        self.quantized_weight, self.weight_scale.data = AbsmeanQuantization.quantize(weight)
+        quantized_weight, weight_scale = AbsmeanQuantization.quantize(self.weight)
+        self.quantized_weight.copy_(quantized_weight)
+        self.weight_scale.data.copy_(weight_scale)

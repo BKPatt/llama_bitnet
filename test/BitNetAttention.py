@@ -8,6 +8,16 @@ from QuantizedLinear import QuantizedLinear
 from RotaryEmbedding import RotaryEmbedding
 from RotaryEmbedding import apply_rotary_pos_emb
 
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Tuple
+from BitNetB158Config import BitNetB158Config
+from QuantizedLinear import QuantizedLinear
+from RotaryEmbedding import RotaryEmbedding
+from RotaryEmbedding import apply_rotary_pos_emb
+
 class BitNetAttention(nn.Module):
     def __init__(self, config: BitNetB158Config):
         super().__init__()
@@ -23,13 +33,7 @@ class BitNetAttention(nn.Module):
         self.k_proj = QuantizedLinear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = QuantizedLinear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = QuantizedLinear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
-        
-        # Initialize quantized_weight attribute to None
-        self.q_proj.quantized_weight = None
-        self.k_proj.quantized_weight = None
-        self.v_proj.quantized_weight = None
-        self.o_proj.quantized_weight = None
-        
+
         self.rotary_emb = RotaryEmbedding(
             self.head_dim,
             max_position_embeddings=self.max_position_embeddings,
@@ -47,13 +51,9 @@ class BitNetAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
-
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
@@ -73,15 +73,19 @@ class BitNetAttention(nn.Module):
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attention_mask is not None:
+            # attention_mask should be of shape (bsz, 1, q_len, kv_seq_len)
+            if attention_mask.dim() == 2:
+                attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
+            elif attention_mask.dim() == 3:
+                attention_mask = attention_mask.unsqueeze(1)
+            
             attn_weights = attn_weights + attention_mask
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
         attn_output = torch.matmul(attn_weights, value_states)
 
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
@@ -91,7 +95,8 @@ class BitNetAttention(nn.Module):
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch, num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep).
+    The hidden states go from (batch, num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
     """
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:

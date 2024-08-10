@@ -24,12 +24,14 @@ class BitNetB158Pipeline:
         model_file = os.path.join(model_path, "pytorch_model.bin")
         if os.path.exists(model_file):
             state_dict = torch.load(model_file, map_location=self.device)
-            self.model.load_state_dict(state_dict)
+            # Using strict=False to allow loading despite unexpected keys in the state_dict
+            self.model.load_state_dict(state_dict, strict=False)
         else:
             raise FileNotFoundError(f"Model file not found at {model_file}")
 
         self.model.to(self.device)
         self.model.eval()
+
 
     def generate(self, prompt: str, max_length: int = 100, temperature: float = 0.7, top_p: float = 0.9, top_k: int = 50):
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)

@@ -26,6 +26,8 @@ class BitNetB158Config:
     quant_type: str = "absmean"
     output_attentions: bool = False
     output_hidden_states: bool = False
+    num_attention_heads: int = 32
+    num_key_value_heads: int = 8
 
     def __post_init__(self):
         self.head_dim = self.hidden_size // self.num_attention_heads
