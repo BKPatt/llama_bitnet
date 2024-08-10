@@ -15,7 +15,7 @@ class BitNetAttention(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
-        self.num_key_value_heads = 8
+        self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
 
@@ -23,6 +23,12 @@ class BitNetAttention(nn.Module):
         self.k_proj = QuantizedLinear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = QuantizedLinear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = QuantizedLinear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+        
+        # Initialize quantized_weight attribute to None
+        self.q_proj.quantized_weight = None
+        self.k_proj.quantized_weight = None
+        self.v_proj.quantized_weight = None
+        self.o_proj.quantized_weight = None
         
         self.rotary_emb = RotaryEmbedding(
             self.head_dim,
@@ -40,12 +46,6 @@ class BitNetAttention(nn.Module):
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
-
-        for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
-            if getattr(self, proj).quantized_weight is None:
-                getattr(self, proj).quantized_weight = torch.zeros_like(getattr(self, proj).weight, dtype=torch.int8)
-            if getattr(self, proj).weight_scale is None:
-                getattr(self, proj).weight_scale = torch.nn.Parameter(torch.ones(getattr(self, proj).weight.shape[0], 1))
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)

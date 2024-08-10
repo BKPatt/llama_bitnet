@@ -17,12 +17,6 @@ class BitNetMLP(nn.Module):
         self.act_fn = SwiGLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for proj in ['gate_proj', 'up_proj', 'down_proj']:
-            if getattr(self, proj).quantized_weight is None:
-                getattr(self, proj).quantized_weight = torch.zeros_like(getattr(self, proj).weight, dtype=torch.int8)  
-            if getattr(self, proj).weight_scale is None:
-                getattr(self, proj).weight_scale = torch.nn.Parameter(torch.ones(getattr(self, proj).weight.shape[0], 1))
-
         gate_output = self.gate_proj(x)
         up_output = self.up_proj(x)
         

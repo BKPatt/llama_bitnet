@@ -14,17 +14,17 @@ def convert_llama_to_bitnet(model_name: str, save_directory: str):
 
     print("Creating BitNet b1.58 configuration")
     bitnet_config = BitNetB158Config(
-    vocab_size=llama_config.vocab_size,
-    hidden_size=llama_config.hidden_size,
-    intermediate_size=llama_config.intermediate_size,
-    num_hidden_layers=llama_config.num_hidden_layers,
-    num_attention_heads=llama_config.num_attention_heads,
-    num_key_value_heads=llama_config.num_attention_heads // 4,
-    max_position_embeddings=llama_config.max_position_embeddings,
-    rms_norm_eps=llama_config.rms_norm_eps,
-    rope_theta=500000,
-    attention_bias=False,
-)
+        vocab_size=llama_config.vocab_size,
+        hidden_size=llama_config.hidden_size,
+        intermediate_size=llama_config.intermediate_size,
+        num_hidden_layers=llama_config.num_hidden_layers,
+        num_attention_heads=llama_config.num_attention_heads,
+        num_key_value_heads=llama_config.num_attention_heads,
+        max_position_embeddings=llama_config.max_position_embeddings,
+        rms_norm_eps=llama_config.rms_norm_eps,
+        rope_theta=500000,
+        attention_bias=False,
+    )
 
     print("Creating BitNet b1.58 model")
     bitnet_model = BitNetB158Model(bitnet_config)
@@ -37,19 +37,24 @@ def convert_llama_to_bitnet(model_name: str, save_directory: str):
 
         for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
             llama_weight = getattr(llama_layer.self_attn, proj).weight
-            bitnet_weight = getattr(bitnet_layer.self_attn, proj).weight
-            print(f"LLaMA {proj} weight shape: {llama_weight.shape}")
-            print(f"BitNet {proj} weight shape: {bitnet_weight.shape}")
-            getattr(bitnet_layer.self_attn, proj).weight.data.copy_(llama_weight)
-            getattr(bitnet_layer.self_attn, proj).quantize()
+            quantized_weight, weight_scale = AbsmeanQuantization.quantize(llama_weight)
+            
+            # Create quantized_weight attribute dynamically
+            if getattr(bitnet_layer.self_attn, proj).quantized_weight is None:
+                getattr(bitnet_layer.self_attn, proj).quantized_weight = torch.nn.Parameter(torch.zeros_like(quantized_weight, dtype=torch.int8), requires_grad=False)
+            
+            # Create weight_scale attribute dynamically
+            if getattr(bitnet_layer.self_attn, proj).weight_scale is None or getattr(bitnet_layer.self_attn, proj).weight_scale.shape!= weight_scale.shape:
+                getattr(bitnet_layer.self_attn, proj).weight_scale = torch.nn.Parameter(torch.zeros_like(weight_scale), requires_grad=True)
+            
+            getattr(bitnet_layer.self_attn, proj).quantized_weight.copy_(quantized_weight)
+            getattr(bitnet_layer.self_attn, proj).weight_scale.data.copy_(weight_scale)
 
         for proj in ['gate_proj', 'up_proj', 'down_proj']:
             llama_weight = getattr(llama_layer.mlp, proj).weight
-            bitnet_weight = getattr(bitnet_layer.mlp, proj).weight
-            print(f"LLaMA {proj} weight shape: {llama_weight.shape}")
-            print(f"BitNet {proj} weight shape: {bitnet_weight.shape}")
-            getattr(bitnet_layer.mlp, proj).weight.data.copy_(llama_weight)
-            getattr(bitnet_layer.mlp, proj).quantize()
+            quantized_weight, weight_scale = AbsmeanQuantization.quantize(llama_weight)
+            getattr(bitnet_layer.mlp, proj).quantized_weight.copy_(quantized_weight)
+            getattr(bitnet_layer.mlp, proj).weight_scale.data.copy_(weight_scale)
 
         bitnet_layer.input_layernorm.weight.data = llama_layer.input_layernorm.weight.data
         bitnet_layer.post_attention_layernorm.weight.data = llama_layer.post_attention_layernorm.weight.data
