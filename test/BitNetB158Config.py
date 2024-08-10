@@ -8,7 +8,7 @@ class BitNetB158Config:
     intermediate_size: int = 11008
     num_hidden_layers: int = 32
     num_attention_heads: int = 32
-    num_key_value_heads: int = 32
+    num_key_value_heads: int = 8
     max_position_embeddings: int = 4096
     rms_norm_eps: float = 1e-5
     initializer_range: float = 0.02

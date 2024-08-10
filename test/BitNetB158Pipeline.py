@@ -23,7 +23,8 @@ class BitNetB158Pipeline:
         self.model = BitNetB158Model(self.config)
         model_file = os.path.join(model_path, "pytorch_model.bin")
         if os.path.exists(model_file):
-            self.model.load_state_dict(torch.load(model_file, map_location=self.device))
+            state_dict = torch.load(model_file, map_location=self.device)
+            self.model.load_state_dict(state_dict)
         else:
             raise FileNotFoundError(f"Model file not found at {model_file}")
 
@@ -87,7 +88,12 @@ class BitNetB158Pipeline:
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
         with torch.no_grad():
             outputs = self.model(input_ids)
-        logits = outputs["last_hidden_state"][0, -1, :]
+        
+        if isinstance(outputs, tuple):
+            logits = outputs[0][0, -1, :]  # Accessing the last_hidden_state from the tuple
+        else:
+            logits = outputs["last_hidden_state"][0, -1, :]
+        
         top_k = torch.topk(logits, 10)
         print("Top 10 next token probabilities:")
         for value, index in zip(top_k.values, top_k.indices):
@@ -96,23 +102,19 @@ class BitNetB158Pipeline:
 
     def check_model_parameters(self):
         print("Checking model parameters...")
+        total_params = 0
         for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                print(f"{name}: shape={param.shape}, mean={param.mean().item():.4f}, std={param.std().item():.4f}")
+            if 'quantized_weight' in name:
+                print(f"{name}: shape={param.shape}, dtype={param.dtype}")
+                total_params += param.numel() * 1.58 / 8  # 1.58 bits per parameter
+            elif 'weight_scale' in name:
+                print(f"{name}: shape={param.shape}, dtype={param.dtype}")
+                total_params += param.numel() * 32 / 8  # 32 bits for float32
+            else:
+                print(f"{name}: shape={param.shape}, dtype={param.dtype}")
+                total_params += param.numel() * 32 / 8  # 32 bits for float32
         
-        print("\nChecking quantized weights...")
-        for i, layer in enumerate(self.model.layers):
-            for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
-                weight = getattr(layer.self_attn, proj).quantized_weight
-                scale = getattr(layer.self_attn, proj).weight_scale
-                print(f"Layer {i}, {proj}: weight shape={weight.shape}, mean={weight.float().mean().item():.4f}, std={weight.float().std().item():.4f}")
-                print(f"Layer {i}, {proj} scale: shape={scale.shape}, mean={scale.mean().item():.4f}, std={scale.std().item():.4f}")
-            
-            for proj in ['gate_proj', 'up_proj', 'down_proj']:
-                weight = getattr(layer.mlp, proj).quantized_weight
-                scale = getattr(layer.mlp, proj).weight_scale
-                print(f"Layer {i}, MLP {proj}: weight shape={weight.shape}, mean={weight.float().mean().item():.4f}, std={weight.float().std().item():.4f}")
-                print(f"Layer {i}, MLP {proj} scale: shape={scale.shape}, mean={scale.mean().item():.4f}, std={scale.std().item():.4f}")
+        print(f"\nTotal model size: {total_params / (1024**3):.2f} GB")
 
 def main():
     model_path = "./bitnet_model_saved"
