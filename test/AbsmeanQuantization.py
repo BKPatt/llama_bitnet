@@ -9,10 +9,6 @@ class AbsmeanQuantization:
         return q.to(torch.int8), scale
 
     @staticmethod
-    def dequantize(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        return q.float() * scale
-
-    @staticmethod
     def pack(q: torch.Tensor, batch_size: int = 1000000) -> torch.Tensor:
         q_unsigned = (q + 1).to(torch.uint8)
         num_elements = q.numel()

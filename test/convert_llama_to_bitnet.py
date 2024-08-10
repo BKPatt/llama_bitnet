@@ -1,5 +1,6 @@
 import torch
 import os
+import json
 from transformers import LlamaForCausalLM, AutoTokenizer
 from BitNetB158Model import BitNetB158Model
 from BitNetB158Config import BitNetB158Config
@@ -13,18 +14,34 @@ def convert_llama_to_bitnet(model_name: str, save_directory: str):
     llama_tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     print("Creating BitNet b1.58 configuration")
-    bitnet_config = BitNetB158Config(
-        vocab_size=llama_config.vocab_size,
-        hidden_size=llama_config.hidden_size,
-        intermediate_size=llama_config.intermediate_size,  # Use the intermediate size from Llama config
-        num_hidden_layers=llama_config.num_hidden_layers,
-        num_attention_heads=llama_config.num_attention_heads,
-        num_key_value_heads=llama_config.num_attention_heads // 4,
-        max_position_embeddings=llama_config.max_position_embeddings,
-        rms_norm_eps=llama_config.rms_norm_eps,
-        rope_theta=10000,
-        attention_bias=False,
-    )
+    bitnet_config_dict = {
+        "vocab_size": llama_config.vocab_size,
+        "hidden_size": llama_config.hidden_size,
+        "intermediate_size": llama_config.intermediate_size,
+        "num_hidden_layers": llama_config.num_hidden_layers,
+        "num_attention_heads": llama_config.num_attention_heads,
+        "num_key_value_heads": llama_config.num_key_value_heads,
+        "max_position_embeddings": llama_config.max_position_embeddings,
+        "rms_norm_eps": llama_config.rms_norm_eps,
+        "initializer_range": llama_config.initializer_range,
+        "use_cache": llama_config.use_cache,
+        "bos_token_id": llama_config.bos_token_id,
+        "eos_token_id": llama_config.eos_token_id,
+        "tie_word_embeddings": llama_config.tie_word_embeddings,
+        "hidden_act": llama_config.hidden_act,
+        "attention_bias": llama_config.attention_bias,
+        "attention_dropout": llama_config.attention_dropout,
+        "rope_theta": llama_config.rope_theta,
+        "rope_scaling": llama_config.rope_scaling,
+    }
+
+    # Add optional attributes if they exist
+    optional_attrs = ['mlp_bias', 'pretraining_tp', 'hidden_dropout']
+    for attr in optional_attrs:
+        if hasattr(llama_config, attr):
+            bitnet_config_dict[attr] = getattr(llama_config, attr)
+
+    bitnet_config = BitNetB158Config(**bitnet_config_dict)
 
     print("Creating BitNet b1.58 model")
     bitnet_model = BitNetB158Model(bitnet_config)
@@ -35,29 +52,24 @@ def convert_llama_to_bitnet(model_name: str, save_directory: str):
     for i, (llama_layer, bitnet_layer) in enumerate(zip(llama_model.model.layers, bitnet_model.layers)):
         print(f"Processing layer {i+1}/{len(llama_model.model.layers)}")
 
-        for proj in ['q_proj', 'o_proj']:
+        for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
             llama_weight = getattr(llama_layer.self_attn, proj).weight
-            quantized_weight, weight_scale = AbsmeanQuantization.quantize(llama_weight)
-            getattr(bitnet_layer.self_attn, proj).quantized_weight.copy_(quantized_weight)
-            getattr(bitnet_layer.self_attn, proj).weight_scale.data.copy_(weight_scale)
-
-        for proj in ['k_proj', 'v_proj']:
-            llama_weight = getattr(llama_layer.self_attn, proj).weight
-            expanded_weight = llama_weight.repeat(bitnet_config.num_attention_heads // bitnet_config.num_key_value_heads, 1)
-            quantized_weight, weight_scale = AbsmeanQuantization.quantize(expanded_weight)
-            getattr(bitnet_layer.self_attn, proj).quantized_weight.copy_(quantized_weight)
-            getattr(bitnet_layer.self_attn, proj).weight_scale.data.copy_(weight_scale)
+            getattr(bitnet_layer.self_attn, proj).quantize(llama_weight)
 
         for proj in ['gate_proj', 'up_proj', 'down_proj']:
             llama_weight = getattr(llama_layer.mlp, proj).weight
-            quantized_weight, weight_scale = AbsmeanQuantization.quantize(llama_weight)
-            getattr(bitnet_layer.mlp, proj).quantized_weight.copy_(quantized_weight)
-            getattr(bitnet_layer.mlp, proj).weight_scale.data.copy_(weight_scale)
+            getattr(bitnet_layer.mlp, proj).quantize(llama_weight)
 
         bitnet_layer.input_layernorm.weight.data = llama_layer.input_layernorm.weight.data
         bitnet_layer.post_attention_layernorm.weight.data = llama_layer.post_attention_layernorm.weight.data
 
     bitnet_model.norm.weight.data = llama_model.model.norm.weight.data
+
+    print(f"LLaMA vocab size: {llama_config.vocab_size}")
+    print(f"BitNet vocab size: {bitnet_config.vocab_size}")
+    
+    if llama_config.vocab_size != bitnet_config.vocab_size:
+        print("Warning: Vocab sizes do not match!")
 
     os.makedirs(save_directory, exist_ok=True)
 
@@ -65,7 +77,13 @@ def convert_llama_to_bitnet(model_name: str, save_directory: str):
     torch.save(bitnet_model.state_dict(), os.path.join(save_directory, "pytorch_model.bin"))
 
     print("Saving the configuration")
-    bitnet_config.to_json(os.path.join(save_directory, "config.json"))
+    config_dict = {
+        "architectures": ["BitNetB158ForCausalLM"],
+        "model_type": "bitnet_b158",
+        **bitnet_config.__dict__
+    }
+    with open(os.path.join(save_directory, "config.json"), 'w') as f:
+        json.dump(config_dict, f, indent=2)
 
     print("Saving the tokenizer") 
     llama_tokenizer.save_pretrained(save_directory)
