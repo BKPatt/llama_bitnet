@@ -9,10 +9,10 @@ class BitNetB158Model(nn.Module):
     def __init__(self, config: BitNetB158Config):
         super().__init__()
         self.config = config
-        self.padding_idx = config.pad_token_id
+        self.bos_token_id = config.bos_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.bos_token_id)
         self.layers = nn.ModuleList([BitNetB158Layer(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
