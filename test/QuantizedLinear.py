@@ -24,11 +24,19 @@ class QuantizedLinear(nn.Module):
             self.register_parameter('bias', None)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        # Dequantize weights
-        dequantized_weight = AbsmeanQuantization.dequantize(self.quantized_weight, self.weight_scale)
-        
-        # Perform the linear operation
-        return F.linear(input, dequantized_weight, self.bias)
+        # Move the input tensor to the same device as the quantized weight
+        input = input.to(self.quantized_weight.device)
+
+        # Perform the linear operation using quantized weights
+        output = F.linear(input, self.quantized_weight, self.bias)
+
+        # Reshape the weight scale to match the output shape
+        weight_scale = self.weight_scale.view(1, -1)
+
+        # Multiply the output by the reshaped weight scale
+        output = output * weight_scale
+
+        return output
 
     def extra_repr(self) -> str:
         return 'in_features={}, out_features={}, bias={}'.format(

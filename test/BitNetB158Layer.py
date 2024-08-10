@@ -37,12 +37,14 @@ class BitNetB158Layer(nn.Module):
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
+        hidden_states = hidden_states.to(residual.device)
         hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        hidden_states = hidden_states.to(residual.device)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)

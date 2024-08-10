@@ -9,12 +9,12 @@ def convert_llama_to_bitnet():
     model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
     save_directory = "./bitnet_model_saved"
 
-    # Load the pre-trained LLaMA model and tokenizer
+    print(f"Loading LLaMA model: {model_name}")
     llama_model = LlamaForCausalLM.from_pretrained(model_name)
     llama_config = llama_model.config
     llama_tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    # Create BitNet b1.58 configuration
+    print("Creating BitNet b1.58 configuration")
     bitnet_config = BitNetB158Config(
         vocab_size=llama_config.vocab_size,
         hidden_size=llama_config.hidden_size,
@@ -25,27 +25,34 @@ def convert_llama_to_bitnet():
         rms_norm_eps=llama_config.rms_norm_eps,
     )
 
-    # Create BitNet b1.58 model
+    print("Creating BitNet b1.58 model")
     bitnet_model = BitNetB158Model(bitnet_config)
 
-    # Copy weights from LLaMA to BitNet b1.58 and quantize
+    print("Copying weights from LLaMA to BitNet b1.58 and quantizing")
     bitnet_model.embed_tokens.weight.data = llama_model.model.embed_tokens.weight.data
 
     for i, llama_layer in enumerate(llama_model.model.layers):
+        print(f"Processing layer {i+1}/{len(llama_model.model.layers)}")
         bitnet_layer = bitnet_model.layers[i]
 
         # Copy and quantize attention weights
         for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
             llama_weight = getattr(llama_layer.self_attn, proj).weight
             quantized_weight, weight_scale = AbsmeanQuantization.quantize(llama_weight)
-            getattr(bitnet_layer.self_attn, proj).quantized_weight.data = quantized_weight.float()
+            print(f"Layer {i}, {proj} - Original range: {llama_weight.min().item():.4f} to {llama_weight.max().item():.4f}")
+            print(f"Layer {i}, {proj} - Quantized range: {quantized_weight.min().item():.4f} to {quantized_weight.max().item():.4f}")
+            print(f"Layer {i}, {proj} - Scale range: {weight_scale.min().item():.4f} to {weight_scale.max().item():.4f}")
+            getattr(bitnet_layer.self_attn, proj).quantized_weight.data = quantized_weight
             getattr(bitnet_layer.self_attn, proj).weight_scale.data = weight_scale
 
         # Copy and quantize MLP weights
         for proj in ['gate_proj', 'up_proj', 'down_proj']:
             llama_weight = getattr(llama_layer.mlp, proj).weight
             quantized_weight, weight_scale = AbsmeanQuantization.quantize(llama_weight)
-            getattr(bitnet_layer.mlp, proj).quantized_weight.data = quantized_weight.float()
+            print(f"Layer {i}, MLP {proj} - Original range: {llama_weight.min().item():.4f} to {llama_weight.max().item():.4f}")
+            print(f"Layer {i}, MLP {proj} - Quantized range: {quantized_weight.min().item():.4f} to {quantized_weight.max().item():.4f}")
+            print(f"Layer {i}, MLP {proj} - Scale range: {weight_scale.min().item():.4f} to {weight_scale.max().item():.4f}")
+            getattr(bitnet_layer.mlp, proj).quantized_weight.data = quantized_weight
             getattr(bitnet_layer.mlp, proj).weight_scale.data = weight_scale
 
         # Copy layer norm weights
@@ -57,13 +64,13 @@ def convert_llama_to_bitnet():
     # Create the save directory if it doesn't exist
     os.makedirs(save_directory, exist_ok=True)
 
-    # Save the converted model
+    print("Saving the converted model")
     torch.save(bitnet_model.state_dict(), os.path.join(save_directory, "pytorch_model.bin"))
 
-    # Save the configuration
+    print("Saving the configuration")
     bitnet_config.to_json(os.path.join(save_directory, "config.json"))
 
-    # Save the tokenizer
+    print("Saving the tokenizer")
     llama_tokenizer.save_pretrained(save_directory)
 
     print(f"Converted model, configuration, and tokenizer saved to {save_directory}")

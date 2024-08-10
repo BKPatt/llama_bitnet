@@ -48,14 +48,20 @@ class BitNetB158Model(nn.Module):
             inputs_embeds = self.embed_tokens(input_ids)
 
         batch_size, seq_length = input_shape
+
+        if position_ids is None:
+            device = inputs_embeds.device
+            position_ids = torch.arange(seq_length, dtype=torch.long, device=device)
+            position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+
+        if attention_mask is None:
+            attention_mask = torch.ones((batch_size, seq_length), device=inputs_embeds.device)
+
         hidden_states = inputs_embeds
 
         presents = () if use_cache else None
         all_self_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
-
-        if attention_mask is None:
-            attention_mask = torch.ones((batch_size, seq_length), device=hidden_states.device)
 
         for i, layer in enumerate(self.layers):
             if output_hidden_states:
