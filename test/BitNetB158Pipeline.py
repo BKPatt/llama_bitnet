@@ -49,8 +49,8 @@ class BitNetB158Pipeline:
                     past_key_values=past_key_values,
                     use_cache=True
                 )
-            logits = outputs["last_hidden_state"][:, -1, :]
-            past_key_values = outputs["past_key_values"]
+            logits = outputs[0][:, -1, :]  # Accessing the first element (last_hidden_state) from the tuple
+            past_key_values = outputs[1]  # Accessing past_key_values from the tuple
             
             # Apply temperature
             logits = logits / temperature
@@ -72,7 +72,7 @@ class BitNetB158Pipeline:
             # Sample from the filtered distribution
             probs = F.softmax(sorted_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
-            next_token = sorted_indices[next_token]
+            next_token = sorted_indices[next_token].squeeze(1)  # Flatten the next_token tensor
 
             input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=-1)
             attention_mask = torch.cat([attention_mask, torch.ones_like(next_token.unsqueeze(0))], dim=-1)
