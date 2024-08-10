@@ -24,7 +24,6 @@ class BitNetB158Pipeline:
         model_file = os.path.join(model_path, "pytorch_model.bin")
         if os.path.exists(model_file):
             state_dict = torch.load(model_file, map_location=self.device)
-            # Using strict=False to allow loading despite unexpected keys in the state_dict
             self.model.load_state_dict(state_dict, strict=False)
         else:
             raise FileNotFoundError(f"Model file not found at {model_file}")
@@ -46,7 +45,7 @@ class BitNetB158Pipeline:
             with torch.no_grad():
                 outputs = self.model(
                     input_ids=input_ids[:, -1:],
-                    attention_mask=attention_mask,
+                    attention_mask=attention_mask[:, -1:],
                     past_key_values=past_key_values,
                     use_cache=True
                 )

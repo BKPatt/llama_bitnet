@@ -16,13 +16,13 @@ def convert_llama_to_bitnet(model_name: str, save_directory: str):
     bitnet_config = BitNetB158Config(
         vocab_size=llama_config.vocab_size,
         hidden_size=llama_config.hidden_size,
-        intermediate_size=llama_config.intermediate_size,
+        intermediate_size=llama_config.intermediate_size,  # Use the intermediate size from Llama config
         num_hidden_layers=llama_config.num_hidden_layers,
         num_attention_heads=llama_config.num_attention_heads,
         num_key_value_heads=llama_config.num_attention_heads // 4,
         max_position_embeddings=llama_config.max_position_embeddings,
         rms_norm_eps=llama_config.rms_norm_eps,
-        rope_theta=500000,
+        rope_theta=10000,
         attention_bias=False,
     )
 
@@ -35,9 +35,16 @@ def convert_llama_to_bitnet(model_name: str, save_directory: str):
     for i, (llama_layer, bitnet_layer) in enumerate(zip(llama_model.model.layers, bitnet_model.layers)):
         print(f"Processing layer {i+1}/{len(llama_model.model.layers)}")
 
-        for proj in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
+        for proj in ['q_proj', 'o_proj']:
             llama_weight = getattr(llama_layer.self_attn, proj).weight
             quantized_weight, weight_scale = AbsmeanQuantization.quantize(llama_weight)
+            getattr(bitnet_layer.self_attn, proj).quantized_weight.copy_(quantized_weight)
+            getattr(bitnet_layer.self_attn, proj).weight_scale.data.copy_(weight_scale)
+
+        for proj in ['k_proj', 'v_proj']:
+            llama_weight = getattr(llama_layer.self_attn, proj).weight
+            expanded_weight = llama_weight.repeat(bitnet_config.num_attention_heads // bitnet_config.num_key_value_heads, 1)
+            quantized_weight, weight_scale = AbsmeanQuantization.quantize(expanded_weight)
             getattr(bitnet_layer.self_attn, proj).quantized_weight.copy_(quantized_weight)
             getattr(bitnet_layer.self_attn, proj).weight_scale.data.copy_(weight_scale)
 

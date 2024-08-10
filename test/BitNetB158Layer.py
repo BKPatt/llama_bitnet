@@ -30,7 +30,7 @@ class BitNetB158Layer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        attn_outputs = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -38,6 +38,10 @@ class BitNetB158Layer(nn.Module):
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
+        hidden_states = attn_outputs[0]
+        self_attn_weights = attn_outputs[1] if output_attentions else None
+        present_key_value = attn_outputs[-1] if use_cache else None
+
         hidden_states = residual + hidden_states
 
         # Fully Connected
