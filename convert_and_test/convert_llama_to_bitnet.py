@@ -33,7 +33,6 @@ def convert_llama_to_bitnet(model_name: str, save_directory: str):
         "rope_scaling": llama_config.rope_scaling,
     }
 
-    # Add optional attributes if they exist
     optional_attrs = ['mlp_bias', 'pretraining_tp', 'hidden_dropout']
     for attr in optional_attrs:
         if hasattr(llama_config, attr):
@@ -42,7 +41,7 @@ def convert_llama_to_bitnet(model_name: str, save_directory: str):
     bitnet_config = BitNetB158Config(**bitnet_config_dict)
 
     print("Creating BitNet b1.58 model")
-    bitnet_model = BitNetB158Model(bitnet_config)
+    bitnet_model = BitNetB158Model(bitnet_config, tokenizer=llama_tokenizer)
 
     print("Copying weights from LLaMA to BitNet b1.58 and quantizing")
     bitnet_model.embed_tokens.weight.data = llama_model.model.embed_tokens.weight.data
@@ -62,6 +61,7 @@ def convert_llama_to_bitnet(model_name: str, save_directory: str):
         bitnet_layer.post_attention_layernorm.weight.data = llama_layer.post_attention_layernorm.weight.data
 
     bitnet_model.norm.weight.data = llama_model.model.norm.weight.data
+    bitnet_model.quantize()
 
     print(f"LLaMA vocab size: {llama_config.vocab_size}")
     print(f"BitNet vocab size: {bitnet_config.vocab_size}")

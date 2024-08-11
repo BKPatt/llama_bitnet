@@ -18,20 +18,16 @@ class QuantizedLinear(nn.Module):
             self.register_parameter('bias', None)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        # Debugging: Print the input shape
-        print(f"Input shape to QuantizedLinear: {input.shape}")
-        
         output = F.linear(input, self.quantized_weight.float())
-        output = output * self.weight_scale.unsqueeze(1)
-        
-        # Debugging: Print the output shape after projection
-        print(f"Output shape from QuantizedLinear: {output.shape}")
+        output = output * self.weight_scale.view(1, -1)  # Adjust the shape of weight_scale
         
         if self.bias is not None:
             output += self.bias
         return output
 
-    def quantize(self, weight: torch.Tensor):
+    def quantize(self, weight: torch.Tensor = None):
+        if weight is None:
+            return
         quantized_weight, weight_scale = AbsmeanQuantization.quantize(weight)
         self.quantized_weight.copy_(quantized_weight)
-        self.weight_scale.data.copy_(weight_scale.squeeze())
+        self.weight_scale.data.copy_(weight_scale.view(-1))

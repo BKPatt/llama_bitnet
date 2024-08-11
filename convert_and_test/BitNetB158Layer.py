@@ -5,6 +5,7 @@ from BitNetB158Config import BitNetB158Config
 from BitNetAttention import BitNetAttention
 from BitNetMLP import BitNetMLP
 from RMSNorm import RMSNorm
+from AbsmeanQuantization import AbsmeanQuantization
 
 class BitNetB158Layer(nn.Module):
     def __init__(self, config: BitNetB158Config):
@@ -29,7 +30,6 @@ class BitNetB158Layer(nn.Module):
 
         hidden_states = self.input_layernorm(hidden_states)
 
-        # Self Attention
         attn_outputs = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -44,7 +44,6 @@ class BitNetB158Layer(nn.Module):
 
         hidden_states = residual + hidden_states
 
-        # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
@@ -59,3 +58,9 @@ class BitNetB158Layer(nn.Module):
             outputs += (present_key_value,)
 
         return outputs
+    
+    def quantize(self):
+        self.self_attn.quantize()
+        self.mlp.quantize()
+        self.input_layernorm.quantize()
+        self.post_attention_layernorm.quantize()

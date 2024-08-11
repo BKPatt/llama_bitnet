@@ -24,3 +24,8 @@ class BitNetMLP(nn.Module):
         down_output = self.down_proj(intermediate_output)
         
         return down_output
+    
+    def quantize(self):
+        self.gate_proj.quantize()
+        self.up_proj.quantize()
+        self.down_proj.quantize()

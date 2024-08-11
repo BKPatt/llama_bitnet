@@ -6,12 +6,14 @@ from BitNetB158Config import BitNetB158Config
 from BitNetB158Layer import BitNetB158Layer
 from RMSNorm import RMSNorm
 import torch.nn.functional as F
+from AbsmeanQuantization import AbsmeanQuantization
 from util import _expand_mask, _make_causal_mask
 
 class BitNetB158Model(nn.Module):
-    def __init__(self, config: BitNetB158Config):
+    def __init__(self, config: BitNetB158Config, tokenizer=None):
         super().__init__()
         self.config = config
+        self.tokenizer = tokenizer
         self.bos_token_id = config.bos_token_id
         self.vocab_size = config.vocab_size
 
@@ -125,22 +127,14 @@ class BitNetB158Model(nn.Module):
         }
 
     @classmethod
-    def from_pretrained(cls, model_path: str):
-        """
-        Load a BitNetB158Model from a pretrained model saved at `model_path`.
-
-        Parameters:
-        - model_path (str): Path to the directory containing the model's configuration and weights.
-
-        Returns:
-        - BitNetB158Model: An instance of the BitNetB158Model class with the loaded weights.
-        """
+    def from_pretrained(cls, model_path: str, tokenizer=None):
         # Load configuration
         config_path = os.path.join(model_path, "config.json")
         config = BitNetB158Config.from_json(config_path)
 
         # Initialize model
         model = cls(config)
+        model.tokenizer = tokenizer
 
         # Load weights
         weights_path = os.path.join(model_path, "pytorch_model.bin")
@@ -159,37 +153,29 @@ class BitNetB158Model(nn.Module):
         top_k: int = 50, 
         **kwargs
     ) -> str:
-        """
-        Generate text using the BitNetB158Model.
-        
-        Parameters:
-        - input_ids: Input tensor containing the token IDs.
-        - attention_mask: Attention mask tensor.
-        - max_length: Maximum length of the generated sequence.
-        - temperature: Sampling temperature.
-        - top_p: Cumulative probability for nucleus sampling.
-        - top_k: The number of top logits to consider for sampling.
-        - kwargs: Additional arguments for model generation.
-        
-        Returns:
-        - generated_text: The generated text as a string.
-        """
         device = input_ids.device
         past_key_values = None
         generated_tokens = input_ids
 
-        for _ in range(max_length):
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+
+        for _ in range(max_length - input_ids.size(1)):
             with torch.no_grad():
                 outputs = self(
-                    input_ids=generated_tokens[:, -1:],  # Feed only the last token
-                    attention_mask=attention_mask[:, -1:] if attention_mask is not None else None,
+                    input_ids=generated_tokens,
+                    attention_mask=attention_mask,
                     past_key_values=past_key_values,
                     use_cache=True,
                     **kwargs
                 )
             
-            logits = outputs["last_hidden_state"][:, -1, :]
-            past_key_values = outputs["past_key_values"]
+            if isinstance(outputs, dict):
+                logits = outputs["last_hidden_state"][:, -1, :]
+                past_key_values = outputs["past_key_values"]
+            else:
+                logits = outputs[0][:, -1, :]
+                past_key_values = outputs[1]
 
             # Apply temperature scaling
             logits = logits / temperature
@@ -206,18 +192,18 @@ class BitNetB158Model(nn.Module):
 
             # Append the generated token to the sequence
             generated_tokens = torch.cat([generated_tokens, next_token.unsqueeze(1)], dim=1)
-            attention_mask = torch.cat([attention_mask, torch.ones_like(next_token.unsqueeze(1))], dim=1) if attention_mask is not None else None
+            attention_mask = torch.cat([attention_mask, torch.ones_like(next_token.unsqueeze(1))], dim=1)
 
             # Stop if the EOS token is generated
-            if next_token.item() == self.config.eos_token_id:
+            if next_token.item() in self.config.eos_token_id:
                 break
 
-        # Convert generated tokens back to text
+        # Convert generated tokens to text
         generated_text = self.tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
         return generated_text
 
     def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
-        # create causal mask
+        # Create causal mask
         # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
         combined_attention_mask = None
         if input_shape[-1] > 1:
@@ -231,6 +217,13 @@ class BitNetB158Model(nn.Module):
         if attention_mask is not None:
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
             expanded_attn_mask = _expand_mask(attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1])
+            
+            # Ensure the shapes match before combining
+            if combined_attention_mask is not None:
+                max_len = max(combined_attention_mask.size(-1), expanded_attn_mask.size(-1))
+                combined_attention_mask = F.pad(combined_attention_mask, (0, max_len - combined_attention_mask.size(-1)))
+                expanded_attn_mask = F.pad(expanded_attn_mask, (0, max_len - expanded_attn_mask.size(-1)))
+            
             combined_attention_mask = (
                 expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
             )
@@ -238,12 +231,14 @@ class BitNetB158Model(nn.Module):
         return combined_attention_mask
 
     def quantize(self):
-        """Quantize the model weights"""
+        # Quantize embed_tokens
+        q_weight, q_scale = AbsmeanQuantization.quantize(self.embed_tokens.weight.data)
+        self.embed_tokens.weight.data = q_weight.float() * q_scale
+
+        # Quantize norm
+        q_weight, q_scale = AbsmeanQuantization.quantize(self.norm.weight.data)
+        self.norm.weight.data = q_weight.float() * q_scale
+
+        # Quantize all layers
         for layer in self.layers:
-            layer.self_attn.q_proj.quantize()
-            layer.self_attn.k_proj.quantize()
-            layer.self_attn.v_proj.quantize()
-            layer.self_attn.o_proj.quantize()
-            layer.mlp.gate_proj.quantize()
-            layer.mlp.up_proj.quantize()
-            layer.mlp.down_proj.quantize()
+            layer.quantize()
