@@ -1,1 +1,5 @@
 bitnet_model_saved/
+__pycache__/
+combined_output.txt
+combine_scripts.py
+uml.py

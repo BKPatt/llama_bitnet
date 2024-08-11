@@ -5,8 +5,7 @@ from typing import Optional, Tuple
 from BitNetB158Config import BitNetB158Config
 from QuantizedLinear import QuantizedLinear
 from RotaryEmbedding import RotaryEmbedding
-from RotaryEmbedding import apply_rotary_pos_emb
-from util import repeat_kv
+from util import repeat_kv, apply_rotary_pos_emb
 
 class BitNetAttention(nn.Module):
     def __init__(self, config: BitNetB158Config):
@@ -39,11 +38,18 @@ class BitNetAttention(nn.Module):
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
-
-        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
+        
+        # Correct projection handling
+        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim)
+        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        
+        # Transpose for attention computation
+        query_states = query_states.transpose(1, 2)  # [batch_size, num_heads, seq_len, head_dim]
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+        
+        # Rotary Embeddings
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
@@ -51,13 +57,13 @@ class BitNetAttention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
-            # reuse k, v, self_attention
+            # Reuse k, v, self_attention
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
         past_key_value = (key_states, value_states) if use_cache else None
 
-        # repeat k/v heads if n_kv_heads < n_heads
+        # Repeat k/v heads if num_key_value_heads < num_heads
         key_states = repeat_kv(key_states, self.num_heads // self.num_key_value_heads)
         value_states = repeat_kv(value_states, self.num_heads // self.num_key_value_heads)
 

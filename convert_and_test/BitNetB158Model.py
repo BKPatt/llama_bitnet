@@ -1,9 +1,11 @@
+import os
 import torch
 import torch.nn as nn
 from typing import Optional, List, Union, Tuple
 from BitNetB158Config import BitNetB158Config
 from BitNetB158Layer import BitNetB158Layer
 from RMSNorm import RMSNorm
+import torch.nn.functional as F
 from util import _expand_mask, _make_causal_mask
 
 class BitNetB158Model(nn.Module):
@@ -121,6 +123,98 @@ class BitNetB158Model(nn.Module):
             "hidden_states": all_hidden_states,
             "attentions": all_self_attns,
         }
+
+    @classmethod
+    def from_pretrained(cls, model_path: str):
+        """
+        Load a BitNetB158Model from a pretrained model saved at `model_path`.
+
+        Parameters:
+        - model_path (str): Path to the directory containing the model's configuration and weights.
+
+        Returns:
+        - BitNetB158Model: An instance of the BitNetB158Model class with the loaded weights.
+        """
+        # Load configuration
+        config_path = os.path.join(model_path, "config.json")
+        config = BitNetB158Config.from_json(config_path)
+
+        # Initialize model
+        model = cls(config)
+
+        # Load weights
+        weights_path = os.path.join(model_path, "pytorch_model.bin")
+        state_dict = torch.load(weights_path, map_location=torch.device('cpu'))
+        model.load_state_dict(state_dict)
+
+        return model
+
+    def generate(
+        self, 
+        input_ids: torch.Tensor, 
+        attention_mask: Optional[torch.Tensor] = None, 
+        max_length: int = 100, 
+        temperature: float = 0.7, 
+        top_p: float = 0.9, 
+        top_k: int = 50, 
+        **kwargs
+    ) -> str:
+        """
+        Generate text using the BitNetB158Model.
+        
+        Parameters:
+        - input_ids: Input tensor containing the token IDs.
+        - attention_mask: Attention mask tensor.
+        - max_length: Maximum length of the generated sequence.
+        - temperature: Sampling temperature.
+        - top_p: Cumulative probability for nucleus sampling.
+        - top_k: The number of top logits to consider for sampling.
+        - kwargs: Additional arguments for model generation.
+        
+        Returns:
+        - generated_text: The generated text as a string.
+        """
+        device = input_ids.device
+        past_key_values = None
+        generated_tokens = input_ids
+
+        for _ in range(max_length):
+            with torch.no_grad():
+                outputs = self(
+                    input_ids=generated_tokens[:, -1:],  # Feed only the last token
+                    attention_mask=attention_mask[:, -1:] if attention_mask is not None else None,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    **kwargs
+                )
+            
+            logits = outputs["last_hidden_state"][:, -1, :]
+            past_key_values = outputs["past_key_values"]
+
+            # Apply temperature scaling
+            logits = logits / temperature
+
+            # Apply top-k and top-p sampling
+            if top_k > 0:
+                top_k_logits, top_k_indices = torch.topk(logits, top_k)
+                probs = torch.nn.functional.softmax(top_k_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                next_token = top_k_indices.gather(-1, next_token).squeeze(1)
+            else:
+                probs = torch.nn.functional.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
+
+            # Append the generated token to the sequence
+            generated_tokens = torch.cat([generated_tokens, next_token.unsqueeze(1)], dim=1)
+            attention_mask = torch.cat([attention_mask, torch.ones_like(next_token.unsqueeze(1))], dim=1) if attention_mask is not None else None
+
+            # Stop if the EOS token is generated
+            if next_token.item() == self.config.eos_token_id:
+                break
+
+        # Convert generated tokens back to text
+        generated_text = self.tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
+        return generated_text
 
     def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
         # create causal mask

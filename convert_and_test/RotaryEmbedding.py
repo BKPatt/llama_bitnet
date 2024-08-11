@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import math
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim: int, max_position_embeddings: int = 2048, base: float = 10000.0, device=None):

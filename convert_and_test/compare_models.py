@@ -1,6 +1,6 @@
 import torch
 from transformers import LlamaForCausalLM, AutoTokenizer
-from BitNetB158Pipeline import BitNetB158Pipeline
+from BitNetB158Model import BitNetB158Model
 
 def generate_llama(model, tokenizer, prompt, max_length=100):
     inputs = tokenizer(prompt, return_tensors="pt")
@@ -8,22 +8,17 @@ def generate_llama(model, tokenizer, prompt, max_length=100):
         outputs = model.generate(**inputs, max_length=max_length)
     return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-def compare_models(llama_model, bitnet_pipeline, llama_tokenizer, prompts):
+def compare_models(llama_model, bitnet_llama, llama_tokenizer, prompts):
     for i, prompt in enumerate(prompts):
         print(f"\nPrompt {i+1}: {prompt}")
         
         llama_output = generate_llama(llama_model, llama_tokenizer, prompt)
-        bitnet_output = generate_llama(bitnet_pipeline, llama_tokenizer, prompt)
+        bitnet_output = generate_llama(bitnet_llama, llama_tokenizer, prompt)
         
         print("\nLLaMA 3.1 output:")
         print(llama_output)
         print("\nBitNet b1.58 output:")
         print(bitnet_output)
-        
-        # You can add more quantitative comparisons here, such as:
-        # - Compare the length of the outputs
-        # - Calculate the similarity between outputs using metrics like BLEU or semantic similarity
-        # - Compare the distribution of words or n-grams in the outputs
 
 def main():
     # Load LLaMA 3.1 model
@@ -33,7 +28,7 @@ def main():
 
     # Load BitNet b1.58 model
     bitnet_model_path = "./bitnet_model_saved"
-    bitnet_pipeline = AutoTokenizer.from_pretrained(bitnet_model_path)
+    bitnet_llama = BitNetB158Model.from_pretrained(bitnet_model_path)
 
     # Prepare a set of diverse prompts
     prompts = [
@@ -45,7 +40,7 @@ def main():
     ]
 
     # Compare the models
-    compare_models(llama_model, bitnet_pipeline, llama_tokenizer, prompts)
+    compare_models(llama_model, bitnet_llama, llama_tokenizer, prompts)
 
 if __name__ == "__main__":
     main()

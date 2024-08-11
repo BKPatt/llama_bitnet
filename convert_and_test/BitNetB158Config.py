@@ -37,15 +37,15 @@ class BitNetB158Config:
     output_attentions: bool = False
     output_hidden_states: bool = False
 
-    def __post_init__(self):
-        self.head_dim = self.hidden_size // self.num_attention_heads
-        assert self.head_dim * self.num_attention_heads == self.hidden_size, "hidden_size must be divisible by num_attention_heads"
-
     @classmethod
     def from_json(cls, json_file):
         with open(json_file, 'r') as f:
             config_dict = json.load(f)
-        return cls(**config_dict)
+        
+        # Filter out any keys that are not in the class's __init__ method
+        valid_args = {k: v for k, v in config_dict.items() if k in cls.__annotations__}
+        
+        return cls(**valid_args)
 
     def to_json(self, json_file):
         with open(json_file, 'w') as f:

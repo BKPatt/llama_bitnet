@@ -4,8 +4,6 @@ import json
 from transformers import LlamaForCausalLM, AutoTokenizer
 from BitNetB158Model import BitNetB158Model
 from BitNetB158Config import BitNetB158Config
-from AbsmeanQuantization import AbsmeanQuantization
-import torch.nn as nn
 
 def convert_llama_to_bitnet(model_name: str, save_directory: str):
     print(f"Loading LLaMA model: {model_name}")

@@ -1,2 +1,0 @@
-Input shape: torch.Size([1, 12])
-Input tokens: ['<|begin_of_text|>', 'Ex', 'plain', 'Ġthe', 'Ġtheory', 'Ġof', 'Ġrel', 'ativity', 'Ġin', 'Ġsimple', 'Ġterms', '.']
