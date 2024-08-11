@@ -30,11 +30,12 @@ def compare_models(llama_model, bitnet_llama, llama_tokenizer, prompts):
 
 def main():
     llama_model_name = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-    llama_model = LlamaForCausalLM.from_pretrained(llama_model_name)
+    # llama_model = LlamaForCausalLM.from_pretrained(llama_model_name)
+    llama_model = 0
     llama_tokenizer = AutoTokenizer.from_pretrained(llama_model_name)
 
     bitnet_model_path = "./bitnet_model_saved"
-    bitnet_llama = BitNetB158Model.from_pretrained(bitnet_model_path, tokenizer=llama_tokenizer)
+    bitnet_llama = LlamaForCausalLM.from_pretrained(bitnet_model_path)
 
     prompts = [
         "Explain the theory of relativity in simple terms.",

@@ -5,7 +5,6 @@ from BitNetB158Config import BitNetB158Config
 from BitNetAttention import BitNetAttention
 from BitNetMLP import BitNetMLP
 from RMSNorm import RMSNorm
-from AbsmeanQuantization import AbsmeanQuantization
 
 class BitNetB158Layer(nn.Module):
     def __init__(self, config: BitNetB158Config):
@@ -26,11 +25,15 @@ class BitNetB158Layer(nn.Module):
             output_attentions: Optional[bool] = False,
             use_cache: Optional[bool] = False,
         ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        
+        # Dequantize hidden states
+        hidden_states = hidden_states.float() / 128.0
+        
         residual = hidden_states
-
         hidden_states = self.input_layernorm(hidden_states)
 
-        attn_outputs = self.self_attn(
+        # Self Attention
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -38,16 +41,16 @@ class BitNetB158Layer(nn.Module):
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
-        hidden_states = attn_outputs[0]
-        self_attn_weights = attn_outputs[1] if output_attentions else None
-        present_key_value = attn_outputs[-1] if use_cache else None
-
         hidden_states = residual + hidden_states
 
+        # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+        
+        # Quantize hidden states back to ternary
+        hidden_states = torch.clamp(hidden_states * 128.0, -128, 127).to(torch.int8)
 
         outputs = (hidden_states,)
 
@@ -58,8 +61,9 @@ class BitNetB158Layer(nn.Module):
             outputs += (present_key_value,)
 
         return outputs
-    
+
     def quantize(self):
+        # Quantize the components within the layer
         self.self_attn.quantize()
         self.mlp.quantize()
         self.input_layernorm.quantize()

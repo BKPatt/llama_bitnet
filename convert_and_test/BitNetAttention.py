@@ -1,6 +1,6 @@
-import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional, Tuple
 from BitNetB158Config import BitNetB158Config
 from QuantizedLinear import QuantizedLinear
@@ -36,19 +36,17 @@ class BitNetAttention(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        batch_size, seq_length, _ = hidden_states.size()
+        batch_size, seq_length, _ = hidden_states.shape
 
+        # Project hidden states to query, key, and value states
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(batch_size, seq_length, self.num_heads, self.head_dim)
-        key_states = key_states.view(batch_size, seq_length, self.num_key_value_heads, self.head_dim)
-        value_states = value_states.view(batch_size, seq_length, self.num_key_value_heads, self.head_dim)
-
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
+        # Reshape to (batch_size, num_heads, seq_length, head_dim)
+        query_states = query_states.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(batch_size, seq_length, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(batch_size, seq_length, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
@@ -57,40 +55,36 @@ class BitNetAttention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
+            # Concatenate past key/value states
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
         past_key_value = (key_states, value_states) if use_cache else None
 
+        # Repeat key/value states to match the number of attention heads
         key_states = repeat_kv(key_states, self.num_heads // self.num_key_value_heads)
         value_states = repeat_kv(value_states, self.num_heads // self.num_key_value_heads)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        # Compute attention scores
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / torch.sqrt(torch.tensor(self.head_dim, dtype=query_states.dtype))
 
         if attention_mask is not None:
-            # Adjust attention_mask shape to match attn_weights
-            if attention_mask.dim() == 2:
-                attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
-            elif attention_mask.dim() == 3:
-                attention_mask = attention_mask.unsqueeze(1)
-            
-            attention_mask = attention_mask.expand(batch_size, self.num_heads, seq_length, attention_mask.size(-1))
-            
+            # Adjust attention_mask to match the shape of attn_weights
+            attention_mask = attention_mask[:, :, -query_states.size(2):, :]
             attn_weights = attn_weights + attention_mask
 
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+        # Apply softmax to get attention probabilities
+        attn_weights = F.softmax(attn_weights, dim=-1)
 
+        # Compute attention output
         attn_output = torch.matmul(attn_weights, value_states)
-
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_length, self.hidden_size)
         attn_output = self.o_proj(attn_output)
 
-        if not output_attentions:
-            attn_weights = None
+        return attn_output, attn_weights if output_attentions else None, past_key_value
 
-        return attn_output, attn_weights, past_key_value
-    
     def quantize(self):
+        # Quantize the projection layers
         self.q_proj.quantize()
         self.k_proj.quantize()
         self.v_proj.quantize()

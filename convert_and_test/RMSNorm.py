@@ -14,7 +14,9 @@ class RMSNorm(nn.Module):
         self.quantized_weight, self.weight_scale = AbsmeanQuantization.quantize(self.weight.data)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
+        # Dequantize hidden states
+        hidden_states = hidden_states.float() / 128.0
+        
         variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         
@@ -23,5 +25,7 @@ class RMSNorm(nn.Module):
         else:
             weight = self.weight
         
-        return (weight * hidden_states).to(input_dtype)
-    
+        output = weight * hidden_states
+        
+        # Quantize output back to ternary
+        return torch.clamp(output * 128.0, -128, 127).to(torch.int8)
